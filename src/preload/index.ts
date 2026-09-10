@@ -1,0 +1,83 @@
+import { contextBridge, ipcRenderer } from "electron";
+import type { AgentUiEvent, AppSnapshot, GroupSort, SessionMode, SessionSort, StartOptions } from "../shared/types";
+import type { GrokSettings } from "../shared/grok-settings";
+
+export type GrokApi = {
+  getState: () => Promise<AppSnapshot>;
+  pickFolder: () => Promise<string | null>;
+  start: (workspace: string, options?: boolean | StartOptions) => Promise<AppSnapshot>;
+  beginNewChat: (workspace?: string) => Promise<AppSnapshot>;
+  setWorkspace: (folder: string) => Promise<AppSnapshot>;
+  setInspectorWidth: (width: number) => Promise<AppSnapshot>;
+  send: (text: string) => Promise<AppSnapshot>;
+  cancel: () => Promise<AppSnapshot>;
+  permission: (requestId: string, optionId: string | null) => Promise<AppSnapshot>;
+  loadSession: (sessionId: string, cwd?: string) => Promise<AppSnapshot>;
+  openSession: (sessionId: string, cwd?: string) => Promise<AppSnapshot>;
+  refreshSessions: () => Promise<AppSnapshot>;
+  renameSession: (sessionId: string, title: string) => Promise<AppSnapshot>;
+  pinSession: (sessionId: string, pinned: boolean) => Promise<AppSnapshot>;
+  archiveSession: (sessionId: string, archived: boolean) => Promise<AppSnapshot>;
+  deleteSession: (sessionId: string) => Promise<AppSnapshot>;
+  setSidebarCollapsed: (collapsed: boolean) => Promise<AppSnapshot>;
+  setInspectorOpen: (open: boolean) => Promise<AppSnapshot>;
+  toggleGroup: (cwd: string) => Promise<AppSnapshot>;
+  setCollapsedGroups: (keys: string[]) => Promise<AppSnapshot>;
+  setSidebarSort: (groupSort?: GroupSort, sessionSort?: SessionSort) => Promise<AppSnapshot>;
+  refreshAccount: () => Promise<AppSnapshot>;
+  setAlwaysApprove: (value: boolean) => Promise<AppSnapshot>;
+  setSessionMode: (mode: SessionMode) => Promise<AppSnapshot>;
+  setGrokSetting: (key: keyof GrokSettings, value: unknown) => Promise<AppSnapshot>;
+  checkUpdate: () => Promise<AppSnapshot>;
+  applyUpdate: () => Promise<AppSnapshot>;
+  dismissInterrupted: (sessionId: string) => Promise<AppSnapshot>;
+  copyText: (text: string) => Promise<boolean>;
+  openPath: (folder: string) => Promise<{ ok: boolean; error?: string }>;
+  onEvent: (cb: (event: AgentUiEvent) => void) => () => void;
+};
+
+const api: GrokApi = {
+  getState: () => ipcRenderer.invoke("grok:getState"),
+  pickFolder: () => ipcRenderer.invoke("grok:pickFolder"),
+  start: (workspace, options) => ipcRenderer.invoke("grok:start", workspace, options),
+  beginNewChat: (workspace) => ipcRenderer.invoke("grok:beginNewChat", workspace),
+  setWorkspace: (folder) => ipcRenderer.invoke("grok:setWorkspace", folder),
+  setInspectorWidth: (width) => ipcRenderer.invoke("grok:setInspectorWidth", width),
+  send: (text) => ipcRenderer.invoke("grok:send", text),
+  cancel: () => ipcRenderer.invoke("grok:cancel"),
+  permission: (requestId, optionId) => ipcRenderer.invoke("grok:permission", requestId, optionId),
+  loadSession: (sessionId, cwd) => ipcRenderer.invoke("grok:loadSession", sessionId, cwd),
+  openSession: (sessionId, cwd) => ipcRenderer.invoke("grok:openSession", sessionId, cwd),
+  refreshSessions: () => ipcRenderer.invoke("grok:refreshSessions"),
+  renameSession: (sessionId, title) => ipcRenderer.invoke("grok:renameSession", sessionId, title),
+  pinSession: (sessionId, pinned) => ipcRenderer.invoke("grok:pinSession", sessionId, pinned),
+  archiveSession: (sessionId, archived) => ipcRenderer.invoke("grok:archiveSession", sessionId, archived),
+  deleteSession: (sessionId) => ipcRenderer.invoke("grok:deleteSession", sessionId),
+  setSidebarCollapsed: (collapsed) => ipcRenderer.invoke("grok:setSidebarCollapsed", collapsed),
+  setInspectorOpen: (open) => ipcRenderer.invoke("grok:setInspectorOpen", open),
+  toggleGroup: (cwd) => ipcRenderer.invoke("grok:toggleGroup", cwd),
+  setCollapsedGroups: (keys) => ipcRenderer.invoke("grok:setCollapsedGroups", keys),
+  setSidebarSort: (groupSort, sessionSort) => ipcRenderer.invoke("grok:setSidebarSort", groupSort, sessionSort),
+  refreshAccount: () => ipcRenderer.invoke("grok:refreshAccount"),
+  setAlwaysApprove: (value) => ipcRenderer.invoke("grok:setAlwaysApprove", value),
+  setSessionMode: (mode) => ipcRenderer.invoke("grok:setSessionMode", mode),
+  setGrokSetting: (key, value) => ipcRenderer.invoke("grok:setGrokSetting", key, value),
+  checkUpdate: () => ipcRenderer.invoke("grok:checkUpdate"),
+  applyUpdate: () => ipcRenderer.invoke("grok:applyUpdate"),
+  dismissInterrupted: (sessionId) => ipcRenderer.invoke("grok:dismissInterrupted", sessionId),
+  copyText: (text) => ipcRenderer.invoke("grok:copyText", text),
+  openPath: (folder) => ipcRenderer.invoke("grok:openPath", folder),
+  onEvent: (cb) => {
+    const listener = (_event: unknown, payload: AgentUiEvent) => cb(payload);
+    ipcRenderer.on("grok:event", listener);
+    return () => ipcRenderer.removeListener("grok:event", listener);
+  },
+};
+
+contextBridge.exposeInMainWorld("grok", api);
+
+declare global {
+  interface Window {
+    grok: GrokApi;
+  }
+}

@@ -1,0 +1,1082 @@
+import { randomUUID } from "node:crypto";
+import { BrowserWindow, Notification } from "electron";
+import { ABSORBED_BY_STREAM, AcpClient } from "../shared/acp-client";
+import type {
+  AgentUiEvent,
+  AppSnapshot,
+  JsonValue,
+  ModelInfo,
+  PermissionOption,
+  PermissionRequest,
+  GroupSort,
+  SessionMode,
+  SessionSort,
+  StartOptions,
+  TimelineItem,
+  ToolDiff,
+} from "../shared/types";
+import { parseGroupSort, parseSessionSort } from "../shared/types";
+import { resolveGrokBinary } from "./resolve-binary";
+import { startGrokServe, stopGrokServe, type ServeHandle } from "./grok-process";
+import { listLocalSessions, purgeSession, sanitizeSessionTitle, writeSessionTitle } from "./session-store";
+import { loadSessionTranscript } from "./session-transcript";
+import { LocalDb } from "./local-db";
+import { fetchQuota, loadAccountSeed } from "./account";
+import { mergeSlashCommands, parseSlashCommands } from "../shared/slash";
+import { normalizeUserText } from "../shared/message-text";
+import { readEventStats, touchStats, type StatsCursor } from "../shared/step-stats";
+import { GROK_SETTINGS_DEFAULTS, isGrokSettingKey, type GrokSettings } from "../shared/grok-settings";
+import { applySetting, loadGrokToml, saveGrokToml, settingsFromToml } from "./grok-config";
+import { checkGrokUpdate, collectAtRisk, installGrokUpdate, recordTranslatedUpdate } from "./grok-update";
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function parseModel(rec: Record<string, unknown>): ModelInfo | undefined {
+  const modelId = asString(rec.modelId);
+  if (!modelId) return undefined;
+  const meta = asRecord(rec._meta) ?? rec;
+  const raw = meta.reasoningEfforts ?? rec.reasoningEfforts;
+  const efforts: string[] = [];
+  if (Array.isArray(raw)) {
+    for (const row of raw) {
+      if (typeof row === "string" && row.trim()) efforts.push(row.trim());
+      else {
+        const nested = asRecord(row);
+        const id = asString(nested?.id) ?? asString(nested?.value) ?? asString(nested?.effort);
+        if (id) efforts.push(id);
+      }
+    }
+  }
+  const supports = meta.supportsReasoningEffort === true || efforts.length > 0;
+  return {
+    modelId,
+    name: asString(rec.name) ?? modelId,
+    efforts: supports ? (efforts.length ? efforts : ["low", "medium", "high", "xhigh"]) : [],
+    defaultEffort: asString(meta.reasoningEffort) ?? asString(meta.defaultReasoningEffort),
+  };
+}
+
+function clampInspectorWidth(width: number): number {
+  return Math.min(720, Math.max(240, Math.round(width)));
+}
+
+function collectText(content: unknown): string {
+  if (typeof content === "string") return content;
+  const rec = asRecord(content);
+  if (!rec) return "";
+  if (typeof rec.text === "string") return rec.text;
+  if (Array.isArray(rec.content)) {
+    return rec.content.map(collectText).filter(Boolean).join("");
+  }
+  return "";
+}
+
+function collectDiffs(content: unknown): ToolDiff[] {
+  if (!Array.isArray(content)) return [];
+  const diffs: ToolDiff[] = [];
+  for (const entry of content) {
+    const rec = asRecord(entry);
+    if (!rec) continue;
+    const type = asString(rec.type);
+    if (type === "diff") {
+      diffs.push({
+        path: asString(rec.path) ?? "file",
+        oldText: asString(rec.oldText),
+        newText: asString(rec.newText),
+      });
+    }
+  }
+  return diffs;
+}
+
+function collectOutput(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const entry of content) {
+    const rec = asRecord(entry);
+    if (!rec) continue;
+    if (asString(rec.type) === "content" || asString(rec.type) === "text") {
+      const text = collectText(rec.content ?? rec);
+      if (text) parts.push(text);
+    }
+  }
+  return parts.length ? parts.join("\n") : undefined;
+}
+
+export class AgentHost {
+  private serve: ServeHandle | undefined;
+  private client: AcpClient | undefined;
+  private grokBinary?: string;
+  private db = new LocalDb();
+  private listeners = new Set<(event: AgentUiEvent) => void>();
+  private hydrating = false;
+  private statsCursor: StatsCursor = {};
+  private permissionWaiters = new Map<
+    string,
+    { resolve: (optionId: string | null) => void }
+  >();
+  private snapshot: AppSnapshot = {
+    connection: "idle",
+    models: [],
+    timeline: [],
+    busy: false,
+    sessions: [],
+    alwaysApprove: false,
+    sessionMode: "ask",
+    sidebarCollapsed: false,
+    inspectorOpen: false,
+    inspectorWidth: 320,
+    collapsedGroups: [],
+    groupSort: "recent",
+    sessionSort: "recent",
+    account: { connection: "idle" },
+    commands: mergeSlashCommands(),
+    settings: GROK_SETTINGS_DEFAULTS,
+  };
+
+  onEvent(listener: (event: AgentUiEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getSnapshot(): AppSnapshot {
+    return this.snapshot;
+  }
+
+  private emit(event: AgentUiEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+
+  private patch(partial: Partial<AppSnapshot>): void {
+    this.snapshot = { ...this.snapshot, ...partial };
+    this.snapshot.account = {
+      ...this.snapshot.account,
+      email: this.snapshot.accountEmail ?? this.snapshot.account.email,
+      modelName: this.snapshot.modelName ?? this.snapshot.account.modelName,
+      agentVersion: this.snapshot.agentVersion ?? this.snapshot.account.agentVersion,
+      grokBinary: this.snapshot.grokBinary ?? this.snapshot.account.grokBinary,
+      connection: this.snapshot.connection,
+    };
+    this.emit({ type: "snapshot", snapshot: this.snapshot });
+  }
+
+  setAlwaysApprove(value: boolean): void {
+    this.setSessionMode(value ? "yolo" : "ask");
+  }
+
+  setSessionMode(mode: SessionMode): void {
+    this.db.setKv("lastMode", mode);
+    if (mode === "ask" || mode === "auto" || mode === "yolo") {
+      this.setGrokSetting("permissionMode", mode === "yolo" ? "always-approve" : mode);
+    }
+    this.patch({
+      sessionMode: mode,
+      alwaysApprove: mode === "yolo",
+    });
+  }
+
+  async initLocal(): Promise<void> {
+    try {
+      await this.db.init();
+    } catch (err) {
+      console.error("local sqlite init failed", err);
+    }
+    const seed = await loadAccountSeed();
+    this.patch({
+      sidebarCollapsed: this.db.getBool("sidebarCollapsed", false),
+      inspectorOpen: this.db.getBool("inspectorOpen", false),
+      inspectorWidth: clampInspectorWidth(this.db.getNumber("inspectorWidth", 320)),
+      collapsedGroups: this.db.getJson<string[]>("collapsedGroups", []),
+      groupSort: parseGroupSort(this.db.getKv("groupSort")),
+      sessionSort: parseSessionSort(this.db.getKv("sessionSort")),
+      alwaysApprove: this.db.getBool("alwaysApprove", false),
+      sessionMode: (this.db.getKv("lastMode") as SessionMode | undefined) ?? "ask",
+      workspace: this.db.getKv("lastWorkspace"),
+      modelId: this.db.getKv("lastModelId"),
+      effort: this.db.getKv("lastEffort"),
+      account: {
+        email: seed.email,
+        connection: this.snapshot.connection,
+      },
+    });
+    this.reloadGrokSettings();
+    await this.loadLocalSessions();
+    void this.refreshAccount();
+    void this.refreshUpdate();
+    setInterval(() => void this.refreshUpdate(), 30 * 60_000);
+    void this.ensureConnected().catch((err) => {
+      console.error("auto-connect failed", err);
+    });
+  }
+
+  private reloadGrokSettings(): GrokSettings {
+    const settings = settingsFromToml(loadGrokToml());
+    const alwaysApprove = settings.permissionMode === "always-approve";
+    this.db.setKv("alwaysApprove", alwaysApprove ? "1" : "0");
+    if (settings.defaultModel) this.db.setKv("lastModelId", settings.defaultModel);
+    if (settings.defaultEffort) this.db.setKv("lastEffort", settings.defaultEffort);
+    this.patch({
+      settings,
+      alwaysApprove,
+      sessionMode: alwaysApprove ? "yolo" : settings.permissionMode === "auto" ? "auto" : "ask",
+      modelId: settings.defaultModel || this.snapshot.modelId,
+      effort: settings.defaultEffort || this.snapshot.effort,
+    });
+    return settings;
+  }
+
+  setGrokSetting(key: keyof GrokSettings, value: unknown): GrokSettings {
+    if (!isGrokSettingKey(key)) return this.snapshot.settings;
+    const table = loadGrokToml();
+    applySetting(table, key, value);
+    saveGrokToml(table);
+    return this.reloadGrokSettings();
+  }
+
+  async refreshUpdate(): Promise<void> {
+    if (this.snapshot.update?.applying) return;
+    const previous = this.snapshot.update;
+    this.patch({
+      update: {
+        currentVersion: previous?.currentVersion ?? this.snapshot.agentVersion ?? "",
+        latestVersion: previous?.latestVersion,
+        updateAvailable: previous?.updateAvailable ?? false,
+        channel: previous?.channel,
+        installer: previous?.installer,
+        currentNotes: previous?.currentNotes,
+        latestNotes: previous?.latestNotes,
+        translatedLog: previous?.translatedLog,
+        atRisk: previous?.atRisk ?? [],
+        checking: true,
+        error: undefined,
+      },
+    });
+    try {
+      const info = await checkGrokUpdate(this.grokBinary);
+      info.atRisk = collectAtRisk(this.snapshot.sessions, this.snapshot.sessionId, this.snapshot.busy);
+      this.patch({ update: { ...info, checking: false } });
+    } catch (err) {
+      this.patch({
+        update: {
+          currentVersion: previous?.currentVersion ?? this.snapshot.agentVersion ?? "",
+          latestVersion: previous?.latestVersion,
+          updateAvailable: previous?.updateAvailable ?? false,
+          currentNotes: previous?.currentNotes,
+          latestNotes: previous?.latestNotes,
+          translatedLog: previous?.translatedLog,
+          atRisk: previous?.atRisk ?? [],
+          checking: false,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+    }
+  }
+
+  async applyGrokUpdate(): Promise<void> {
+    const current = this.snapshot.update ?? (await checkGrokUpdate(this.grokBinary));
+    const atRisk = collectAtRisk(this.snapshot.sessions, this.snapshot.sessionId, this.snapshot.busy);
+    this.patch({ update: { ...current, atRisk, applying: true, checking: false, error: undefined } });
+    const resumeId = this.snapshot.sessionId;
+    const resumeCwd = this.snapshot.workspace;
+    const interruptIds = new Set(atRisk.map((row) => row.sessionId));
+    if (resumeId) interruptIds.add(resumeId);
+    this.db.markInterrupted([...interruptIds]);
+    try {
+      if (this.snapshot.busy) {
+        try {
+          await this.cancel();
+        } catch {
+          /* continue */
+        }
+      }
+      await this.stop();
+      await installGrokUpdate(this.grokBinary, current.installer);
+      this.grokBinary = resolveGrokBinary();
+      const info = await checkGrokUpdate(this.grokBinary);
+      this.patch({ update: { ...info, applying: true, translating: true, atRisk: [] } });
+      try {
+        info.translatedLog = await recordTranslatedUpdate(
+          this.grokBinary,
+          info.currentVersion,
+          info.currentNotes || current.latestNotes || current.currentNotes || "",
+        );
+      } catch (err) {
+        console.error("record translated changelog failed", err);
+      }
+      this.patch({ update: { ...info, applying: false, translating: false, atRisk: [] } });
+      await this.ensureConnected();
+      await this.loadLocalSessions();
+      if (resumeId) {
+        await this.openSession(resumeId, resumeCwd);
+        this.pushItem({
+          id: randomUUID(),
+          kind: "system",
+          tone: "info",
+          text: `Grok Build 已更新到 ${info.currentVersion}。上一轮对话已中断。`,
+          at: Date.now(),
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.patch({
+        update: { ...current, atRisk, applying: false, error: message },
+      });
+      try {
+        await this.ensureConnected();
+      } catch {
+        /* leave connection error */
+      }
+      await this.loadLocalSessions();
+      throw err;
+    }
+  }
+
+  async dismissInterrupted(sessionId: string): Promise<void> {
+    this.db.clearInterrupted(sessionId);
+    await this.loadLocalSessions();
+  }
+
+  private desktopNotify(kind: "turn_complete" | "approval_required", body: string): void {
+    try {
+      const settings = this.snapshot.settings;
+      if (settings.notifyMethod === "none" || settings.notifyCondition === "never") return;
+      if (kind === "turn_complete" && !settings.notifyTurnComplete) return;
+      if (kind === "approval_required" && !settings.notifyApproval) return;
+      if (settings.notifyCondition === "unfocused") {
+        const focused = BrowserWindow.getAllWindows().some((win) => !win.isDestroyed() && win.isFocused());
+        if (focused) return;
+      }
+      new Notification({ title: "Grok", body }).show();
+    } catch (err) {
+      console.error("desktop notify failed", err);
+    }
+  }
+
+  private pushItem(item: TimelineItem): void {
+    this.snapshot = { ...this.snapshot, timeline: [...this.snapshot.timeline, item] };
+    this.emit({ type: "timeline", item });
+    this.emit({ type: "snapshot", snapshot: this.snapshot });
+  }
+
+  private patchItem(id: string, patch: Partial<TimelineItem>): void {
+    this.snapshot = {
+      ...this.snapshot,
+      timeline: this.snapshot.timeline.map((item) =>
+        item.id === id ? ({ ...item, ...patch } as TimelineItem) : item,
+      ),
+    };
+    this.emit({ type: "timeline-patch", id, patch });
+    this.emit({ type: "snapshot", snapshot: this.snapshot });
+  }
+
+  private fail(message: string): void {
+    this.patch({ connection: "error", error: message, busy: false });
+  }
+
+  async loadLocalSessions(): Promise<void> {
+    const sessions = this.db.mergeSessions(await listLocalSessions(), this.snapshot.sessionId);
+    const current = sessions.find((row) => row.sessionId === this.snapshot.sessionId);
+    this.patch({
+      sessions,
+      sessionTitle: current?.title ?? this.snapshot.sessionTitle,
+    });
+  }
+
+  async renameSession(sessionId: string, title: string): Promise<void> {
+    const clean = sanitizeSessionTitle(title);
+    if (!clean) return;
+    const known = this.snapshot.sessions.find((row) => row.sessionId === sessionId);
+    this.db.setTitle(sessionId, clean);
+    await writeSessionTitle(sessionId, clean, known?.cwd);
+    if (this.snapshot.sessionId === sessionId) {
+      this.patch({ sessionTitle: clean });
+    }
+    await this.loadLocalSessions();
+  }
+
+  async setPinned(sessionId: string, pinned: boolean): Promise<void> {
+    this.db.setPinned(sessionId, pinned);
+    await this.loadLocalSessions();
+  }
+
+  async setArchived(sessionId: string, archived: boolean): Promise<void> {
+    this.db.setArchived(sessionId, archived);
+    if (archived && this.snapshot.collapsedGroups.includes("__archived__")) {
+      const collapsedGroups = this.snapshot.collapsedGroups.filter((key) => key !== "__archived__");
+      this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
+      this.patch({ collapsedGroups });
+    }
+    await this.loadLocalSessions();
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const known = this.snapshot.sessions.find((row) => row.sessionId === sessionId);
+    if (this.snapshot.sessionId === sessionId) {
+      if (this.snapshot.busy) {
+        try {
+          await this.cancel();
+        } catch {
+          /* continue */
+        }
+      }
+      if (this.client?.connected) {
+        try {
+          await this.client.request("session/close", { sessionId }, 8_000);
+        } catch {
+          /* grok 可能没有实现 close */
+        }
+      }
+      this.patch({
+        sessionId: undefined,
+        sessionTitle: undefined,
+        timeline: [],
+        workspace: undefined,
+        busy: false,
+        permission: undefined,
+      });
+    }
+
+    let binary: string | undefined = this.grokBinary;
+    if (!binary) {
+      try {
+        binary = resolveGrokBinary();
+      } catch {
+        binary = undefined;
+      }
+    }
+    await purgeSession(sessionId, known?.cwd, binary);
+    this.db.deleteFlags(sessionId);
+    await this.loadLocalSessions();
+    if (this.snapshot.sessions.some((row) => row.sessionId === sessionId)) {
+      throw new Error("会话删除失败，目录仍在。");
+    }
+  }
+
+  setSidebarCollapsed(collapsed: boolean): void {
+    this.db.setKv("sidebarCollapsed", collapsed ? "1" : "0");
+    this.patch({ sidebarCollapsed: collapsed });
+  }
+
+  setInspectorOpen(open: boolean): void {
+    this.db.setKv("inspectorOpen", open ? "1" : "0");
+    this.patch({ inspectorOpen: open });
+  }
+
+  setInspectorWidth(width: number): void {
+    const inspectorWidth = clampInspectorWidth(width);
+    this.db.setKv("inspectorWidth", String(inspectorWidth));
+    this.patch({ inspectorWidth });
+  }
+
+  setWorkspace(folder: string): void {
+    const next = folder.trim();
+    this.db.setKv("lastWorkspace", next);
+    if (!this.snapshot.sessionId) this.patch({ workspace: next || undefined });
+  }
+
+  async beginNewChat(workspace?: string): Promise<void> {
+    const nextWorkspace = workspace?.trim() || this.db.getKv("lastWorkspace") || this.snapshot.workspace;
+    try {
+      await this.ensureConnected();
+    } catch (err) {
+      this.fail(err instanceof Error ? err.message : String(err));
+    }
+    if (nextWorkspace) this.db.setKv("lastWorkspace", nextWorkspace);
+    this.patch({
+      sessionId: undefined,
+      sessionTitle: "新对话",
+      timeline: [],
+      permission: undefined,
+      busy: false,
+      error: undefined,
+      workspace: nextWorkspace,
+      sessionMode: (this.db.getKv("lastMode") as SessionMode | undefined) ?? this.snapshot.sessionMode,
+      modelId: this.db.getKv("lastModelId") ?? this.snapshot.modelId,
+      effort: this.db.getKv("lastEffort") ?? this.snapshot.effort,
+    });
+  }
+
+  toggleGroup(cwd: string): void {
+    const set = new Set(this.snapshot.collapsedGroups);
+    if (set.has(cwd)) set.delete(cwd);
+    else set.add(cwd);
+    this.setCollapsedGroups([...set]);
+  }
+
+  setCollapsedGroups(keys: string[]): void {
+    const collapsedGroups = [...new Set(keys.map((key) => String(key)).filter(Boolean))];
+    this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
+    this.patch({ collapsedGroups });
+  }
+
+  setSidebarSort(groupSort?: GroupSort, sessionSort?: SessionSort): void {
+    const nextGroup = parseGroupSort(groupSort ?? this.snapshot.groupSort);
+    const nextSession = parseSessionSort(sessionSort ?? this.snapshot.sessionSort);
+    this.db.setKv("groupSort", nextGroup);
+    this.db.setKv("sessionSort", nextSession);
+    this.patch({ groupSort: nextGroup, sessionSort: nextSession });
+  }
+
+  async refreshAccount(): Promise<void> {
+    const quota = await fetchQuota();
+    this.patch({
+      account: {
+        ...this.snapshot.account,
+        plan: quota?.plan ?? this.snapshot.account.plan,
+        quota,
+      },
+    });
+  }
+
+  private async ensureConnected(alwaysApprove = this.snapshot.alwaysApprove): Promise<AcpClient> {
+    if (this.client?.connected) {
+      this.patch({ connection: "ready", alwaysApprove, error: undefined });
+      return this.client;
+    }
+
+    this.patch({
+      connection: "starting",
+      error: undefined,
+      alwaysApprove,
+      busy: false,
+      permission: undefined,
+    });
+
+    const binary = resolveGrokBinary();
+    this.grokBinary = binary;
+    this.patch({ grokBinary: binary });
+    this.serve = await startGrokServe(binary);
+    const client = new AcpClient({
+      onNotification: (method, params) => this.onNotification(method, params),
+      onRequest: (id, method, params) => this.onRequest(id, method, params),
+      onError: (err) => this.fail(err.message),
+      onClose: (code, reason) => {
+        if (this.snapshot.connection === "ready") {
+          this.fail(`agent 连接关闭 (${code}) ${reason}`.trim());
+        }
+      },
+    });
+    this.client = client;
+    await client.connect(this.serve.url);
+
+    const init = asRecord(
+      await client.request("initialize", {
+        protocolVersion: 1,
+        clientInfo: { name: "grok-harness", version: "0.1.0" },
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+      }),
+    );
+    const meta = asRecord(init?._meta);
+    const modelState = asRecord(meta?.modelState);
+    const models: ModelInfo[] = [];
+    const available = modelState?.availableModels;
+    if (Array.isArray(available)) {
+      for (const row of available) {
+        const rec = asRecord(row);
+        if (!rec) continue;
+        const model = parseModel(rec);
+        if (model) models.push(model);
+      }
+    }
+    const currentModelId = asString(modelState?.currentModelId) ?? this.snapshot.modelId;
+    const currentModel = models.find((model) => model.modelId === currentModelId);
+
+    const auth = asRecord(
+      await client.request("authenticate", { methodId: "cached_token" }),
+    );
+    const authMeta = asRecord(auth?._meta);
+
+    this.patch({
+      connection: "ready",
+      commands: mergeSlashCommands(parseSlashCommands(meta?.availableCommands), this.snapshot.commands),
+      agentVersion: asString(meta?.agentVersion),
+      modelId: currentModelId,
+      modelName: currentModel?.name,
+      effort: this.snapshot.effort ?? currentModel?.defaultEffort,
+      models,
+      accountEmail: asString(authMeta?.email),
+      alwaysApprove,
+      account: {
+        ...this.snapshot.account,
+        email: asString(authMeta?.email) ?? this.snapshot.account.email,
+        plan: asString(authMeta?.subscription_tier) ?? this.snapshot.account.plan,
+        connection: "ready",
+      },
+    });
+    void this.refreshAccount();
+    return client;
+  }
+
+  async start(workspace: string, options: boolean | StartOptions | Record<string, unknown> = false): Promise<void> {
+    const opts: StartOptions =
+      typeof options === "boolean"
+        ? { workspace, mode: options ? "yolo" : "ask" }
+        : { ...(options as StartOptions), workspace };
+    const mode: SessionMode = opts.mode ?? "ask";
+    const alwaysApprove = mode === "yolo";
+    this.statsCursor = {};
+    this.db.setKv("lastWorkspace", workspace);
+    this.db.setKv("lastMode", mode);
+    if (opts.modelId) this.db.setKv("lastModelId", opts.modelId);
+    if (opts.effort) this.db.setKv("lastEffort", opts.effort);
+    this.patch({
+      workspace,
+      sessionId: undefined,
+      timeline: [],
+      permission: undefined,
+      busy: false,
+      alwaysApprove,
+      sessionMode: mode,
+      modelId: opts.modelId ?? this.snapshot.modelId,
+      effort: opts.effort ?? this.snapshot.effort,
+      error: undefined,
+    });
+    try {
+      const client = await this.ensureConnected(alwaysApprove);
+      const created = asRecord(
+        await client.request("session/new", {
+          cwd: workspace,
+          mcpServers: [],
+          _meta: {
+            yoloMode: alwaysApprove,
+            autoMode: mode === "auto",
+          },
+        }),
+      );
+      const sessionId = asString(created?.sessionId);
+      if (!sessionId) throw new Error("session/new 没有返回 sessionId");
+      this.db.markRead(sessionId, Date.now());
+      const createdMeta = asRecord(created?._meta);
+      this.patch({
+        connection: "ready",
+        sessionId,
+        workspace,
+        alwaysApprove,
+        sessionMode: mode,
+        sessionTitle: "新会话",
+        commands: mergeSlashCommands(
+          this.snapshot.commands,
+          parseSlashCommands(created?.availableCommands),
+          parseSlashCommands(createdMeta?.availableCommands),
+        ),
+      });
+      const modelId = opts.modelId ?? this.snapshot.modelId;
+      if (modelId) {
+        await this.setConfigOption("model", modelId);
+        const named = this.snapshot.models.find((model) => model.modelId === modelId);
+        this.patch({ modelId, modelName: named?.name ?? this.snapshot.modelName });
+      }
+      const effort = opts.effort ?? this.snapshot.effort;
+      if (effort) {
+        await this.setConfigOption("reasoning_effort", effort);
+        this.patch({ effort });
+      }
+      await this.loadLocalSessions();
+    } catch (err) {
+      await this.stop();
+      this.fail(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
+  private async setConfigOption(configId: string, value: string): Promise<void> {
+    const client = this.client;
+    const sessionId = this.snapshot.sessionId;
+    if (!client?.connected || !sessionId || !value) return;
+    try {
+      await client.request("session/set_config_option", {
+        sessionId,
+        configId,
+        value: { value },
+      });
+    } catch (err) {
+      console.error(`set_config_option ${configId} failed`, err);
+    }
+  }
+
+  async stop(): Promise<void> {
+    for (const waiter of this.permissionWaiters.values()) waiter.resolve(null);
+    this.permissionWaiters.clear();
+    this.client?.close();
+    this.client = undefined;
+    await stopGrokServe(this.serve?.child);
+    this.serve = undefined;
+    if (this.snapshot.connection !== "error") {
+      this.patch({
+        connection: "stopped",
+        busy: false,
+        permission: undefined,
+        sessionId: undefined,
+      });
+    } else {
+      this.patch({ busy: false, permission: undefined, sessionId: undefined });
+    }
+  }
+
+  async sendPrompt(text: string): Promise<void> {
+    const client = this.client;
+    const sessionId = this.snapshot.sessionId;
+    if (!client || !sessionId) throw new Error("还没有就绪的会话");
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    const firstTurn = !this.snapshot.timeline.some((item) => item.kind === "user");
+    const outbound =
+      this.snapshot.sessionMode === "plan" && firstTurn && !trimmed.startsWith("/")
+        ? `/plan ${trimmed}`
+        : trimmed;
+    this.pushItem({ id: randomUUID(), kind: "user", text: trimmed, at: Date.now() });
+    if (sessionId) this.db.markRead(sessionId, Date.now());
+    this.patch({ busy: true });
+    try {
+      const result = await client.request(
+        "session/prompt",
+        {
+          sessionId,
+          prompt: [{ type: "text", text: outbound }],
+        },
+        15 * 60_000,
+      );
+      if (result !== ABSORBED_BY_STREAM) {
+        this.finishStreaming();
+      }
+    } catch (err) {
+      this.pushItem({
+        id: randomUUID(),
+        kind: "system",
+        tone: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+      this.finishStreaming();
+      throw err;
+    } finally {
+      this.patch({ busy: false });
+      this.desktopNotify("turn_complete", "本轮已完成");
+    }
+  }
+
+  async cancel(): Promise<void> {
+    const client = this.client;
+    const sessionId = this.snapshot.sessionId;
+    if (!client || !sessionId) return;
+    await client.request("session/cancel", { sessionId }, 15_000);
+    this.patch({ busy: false });
+  }
+
+  resolvePermission(requestId: string, optionId: string | null): void {
+    const waiter = this.permissionWaiters.get(requestId);
+    if (!waiter) return;
+    this.permissionWaiters.delete(requestId);
+    this.patch({ permission: undefined });
+    waiter.resolve(optionId);
+  }
+
+  async openSession(sessionId: string, cwd?: string): Promise<void> {
+    if (this.snapshot.busy) {
+      try {
+        await this.cancel();
+      } catch {
+        /* continue */
+      }
+    }
+    const known = this.snapshot.sessions.find((row) => row.sessionId === sessionId);
+    const workspace = cwd || known?.cwd;
+    this.db.markRead(sessionId, Math.max(Date.now(), known?.updatedAtMs ?? 0));
+    const timeline = await loadSessionTranscript(sessionId, workspace);
+    this.statsCursor = {};
+    this.patch({
+      workspace,
+      sessionId,
+      sessionTitle: known?.title ?? "未命名对话",
+      timeline,
+      permission: undefined,
+      busy: false,
+      error: undefined,
+      sessions: this.snapshot.sessions.map((row) =>
+        row.sessionId === sessionId ? { ...row, unread: false } : row,
+      ),
+    });
+    try {
+      const client = await this.ensureConnected();
+      this.hydrating = true;
+      try {
+        const loaded = asRecord(
+          await client.request("session/load", {
+            sessionId,
+            mcpServers: [],
+            ...(workspace ? { cwd: workspace } : {}),
+          }),
+        );
+        const loadedMeta = asRecord(loaded?._meta);
+        this.patch({
+          connection: "ready",
+          sessionId: asString(loaded?.sessionId) ?? sessionId,
+          workspace: workspace ?? this.snapshot.workspace,
+          sessionTitle: known?.title ?? this.snapshot.sessionTitle,
+          commands: mergeSlashCommands(
+            this.snapshot.commands,
+            parseSlashCommands(loaded?.availableCommands),
+            parseSlashCommands(loadedMeta?.availableCommands),
+          ),
+        });
+      } finally {
+        this.hydrating = false;
+      }
+    } catch (err) {
+      this.hydrating = false;
+      this.fail(err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      this.db.markRead(sessionId, Date.now());
+      await this.loadLocalSessions();
+    }
+  }
+
+  async refreshSessions(): Promise<void> {
+    await this.loadLocalSessions();
+  }
+
+  private finishStreaming(): void {
+    this.snapshot = {
+      ...this.snapshot,
+      timeline: this.snapshot.timeline.map((item) =>
+        "streaming" in item && item.streaming ? { ...item, streaming: false } : item,
+      ),
+      busy: false,
+    };
+    this.emit({ type: "snapshot", snapshot: this.snapshot });
+  }
+
+  private onNotification(method: string, params: JsonValue | undefined): void {
+    if (method === "session/update") {
+      const rec = asRecord(params) ?? {};
+      const update = asRecord(rec.update) ?? rec;
+      this.applySessionUpdate(update, asRecord(rec._meta));
+      return;
+    }
+    if (method.startsWith("x.ai/")) {
+      return;
+    }
+  }
+
+  private applySessionUpdate(update: Record<string, unknown>, envelopeMeta?: Record<string, unknown>): void {
+    const kind = asString(update.sessionUpdate);
+    const stats = readEventStats(update, envelopeMeta, Date.now());
+    if (this.hydrating) {
+      if (kind === "available_commands" || kind === "available_commands_update") {
+        this.patch({
+          commands: mergeSlashCommands(
+            this.snapshot.commands,
+            parseSlashCommands(update.availableCommands ?? update.commands ?? update),
+          ),
+        });
+      }
+      return;
+    }
+    if (kind === "user_message_chunk") {
+      const text = normalizeUserText(collectText(update.content ?? update));
+      if (!text) return;
+      if (this.snapshot.timeline.some((item) => item.kind === "user" && item.text === text)) return;
+      const last = [...this.snapshot.timeline].reverse().find((item) => item.kind === "user");
+      if (last && last.kind === "user") {
+        if (text.startsWith(last.text) || last.text.startsWith(text)) {
+          if (text.length > last.text.length) this.patchItem(last.id, { text });
+          return;
+        }
+      }
+      this.pushItem({ id: randomUUID(), kind: "user", text, at: Date.now() });
+      return;
+    }
+    if (kind === "agent_message_chunk" || kind === "agent_message") {
+      const text = collectText(update.content ?? update);
+      this.appendStreaming("assistant", text, stats.at, stats.totalTokens);
+      return;
+    }
+    if (kind === "agent_thought_chunk" || kind === "agent_thought") {
+      const text = collectText(update.content ?? update);
+      this.appendStreaming("thought", text, stats.at, stats.totalTokens);
+      return;
+    }
+    if (kind === "tool_call") {
+      const toolCallId = asString(update.toolCallId) ?? randomUUID();
+      const existing = this.snapshot.timeline.find(
+        (item): item is Extract<TimelineItem, { kind: "tool" }> =>
+          item.kind === "tool" && item.toolCallId === toolCallId,
+      );
+      const diffs = collectDiffs(update.content);
+      const outputText = collectOutput(update.content);
+      if (existing) {
+        touchStats(existing, stats.at, stats.totalTokens, this.statsCursor);
+        this.patchItem(existing.id, {
+          title: asString(update.title) ?? existing.title,
+          status: asString(update.status) ?? existing.status,
+          toolKind: asString(update.kind) ?? existing.toolKind,
+          rawInput: update.rawInput ?? existing.rawInput,
+          diffs: diffs.length ? diffs : existing.diffs,
+          outputText: outputText ?? existing.outputText,
+          durationMs: existing.durationMs,
+          tokens: existing.tokens,
+          at: existing.at,
+        });
+      } else {
+        const item = {
+          id: randomUUID(),
+          kind: "tool" as const,
+          toolCallId,
+          title: asString(update.title) ?? asString(update.toolName) ?? "tool",
+          status: asString(update.status) ?? "pending",
+          toolKind: asString(update.kind) ?? asString(update.toolName),
+          rawInput: update.rawInput,
+          diffs,
+          outputText,
+          at: stats.at ?? Date.now(),
+        };
+        touchStats(item, stats.at, stats.totalTokens, this.statsCursor);
+        this.pushItem(item);
+      }
+      return;
+    }
+    if (kind === "tool_call_update") {
+      const toolCallId = asString(update.toolCallId);
+      if (!toolCallId) return;
+      const existing = this.snapshot.timeline.find(
+        (item) => item.kind === "tool" && item.toolCallId === toolCallId,
+      );
+      if (!existing || existing.kind !== "tool") return;
+      const diffs = collectDiffs(update.content);
+      const outputText = collectOutput(update.content);
+      touchStats(existing, stats.at, stats.totalTokens, this.statsCursor);
+      this.patchItem(existing.id, {
+        status: asString(update.status) ?? existing.status,
+        title: asString(update.title) ?? existing.title,
+        diffs: diffs.length ? diffs : existing.diffs,
+        outputText: outputText ?? existing.outputText,
+        rawInput: update.rawInput ?? existing.rawInput,
+        durationMs: existing.durationMs,
+        tokens: existing.tokens,
+        at: existing.at,
+      });
+      return;
+    }
+    if (kind === "available_commands" || kind === "available_commands_update") {
+      this.patch({
+        commands: mergeSlashCommands(
+          this.snapshot.commands,
+          parseSlashCommands(update.availableCommands ?? update.commands ?? update),
+        ),
+      });
+      return;
+    }
+    if (kind === "plan") {
+      const text =
+        typeof update.entries === "string"
+          ? update.entries
+          : JSON.stringify(update.entries ?? update, null, 2);
+      const existing = [...this.snapshot.timeline].reverse().find((item) => item.kind === "plan");
+      if (existing) this.patchItem(existing.id, { text });
+      else this.pushItem({ id: randomUUID(), kind: "plan", text, at: Date.now() });
+    }
+  }
+
+  private appendStreaming(
+    kind: "assistant" | "thought",
+    text: string,
+    at?: number,
+    totalTokens?: number,
+  ): void {
+    if (!text) return;
+    const last = [...this.snapshot.timeline].reverse().find((item) => item.kind === kind && item.streaming);
+    if (last && last.kind === kind) {
+      touchStats(last, at, totalTokens, this.statsCursor);
+      this.patchItem(last.id, {
+        text: last.text + text,
+        streaming: true,
+        durationMs: last.durationMs,
+        tokens: last.tokens,
+        at: last.at,
+      });
+      return;
+    }
+    this.snapshot = {
+      ...this.snapshot,
+      timeline: this.snapshot.timeline.map((item) =>
+        item.kind === kind && "streaming" in item && item.streaming
+          ? { ...item, streaming: false }
+          : item,
+      ),
+    };
+    const item = { id: randomUUID(), kind, text, streaming: true, at: at ?? Date.now() };
+    touchStats(item, at, totalTokens, this.statsCursor);
+    this.pushItem(item);
+  }
+
+  private async onRequest(
+    _id: number | string,
+    method: string,
+    params: JsonValue | undefined,
+  ): Promise<JsonValue> {
+    if (method === "session/request_permission") {
+      return this.handlePermission(params);
+    }
+    if (method === "x.ai/folder_trust/request") {
+      return { trusted: true, outcome: "allow" };
+    }
+    throw new Error(`未处理的反向请求: ${method}`);
+  }
+
+  private async handlePermission(params: JsonValue | undefined): Promise<JsonValue> {
+    const rec = asRecord(params) ?? {};
+    const toolCall = asRecord(rec.toolCall) ?? {};
+    const rawOptions = Array.isArray(rec.options) ? rec.options : [];
+    const options: PermissionOption[] = [];
+    for (const row of rawOptions) {
+      const opt = asRecord(row);
+      const optionId = asString(opt?.optionId);
+      if (!optionId) continue;
+      options.push({
+        optionId,
+        name: asString(opt?.name) ?? optionId,
+        kind: asString(opt?.kind),
+      });
+    }
+
+    if (this.snapshot.alwaysApprove) {
+      const allow =
+        options.find((o) => /allow/i.test(o.kind ?? "") || /allow/i.test(o.optionId)) ??
+        options[0];
+      if (allow) {
+        return { outcome: { outcome: "selected", optionId: allow.optionId } };
+      }
+    }
+
+    const request: PermissionRequest = {
+      requestId: randomUUID(),
+      sessionId: asString(rec.sessionId) ?? this.snapshot.sessionId ?? "",
+      title: asString(toolCall.title) ?? asString(toolCall.toolName) ?? "需要批准",
+      toolKind: asString(toolCall.kind),
+      toolCallId: asString(toolCall.toolCallId),
+      rawInput: toolCall.rawInput ?? rec.rawInput,
+      options,
+    };
+    this.patch({ permission: request });
+    this.desktopNotify("approval_required", request.title);
+
+    const optionId = await new Promise<string | null>((resolve) => {
+      this.permissionWaiters.set(request.requestId, { resolve });
+    });
+    if (!optionId) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    return { outcome: { outcome: "selected", optionId } };
+  }
+}
