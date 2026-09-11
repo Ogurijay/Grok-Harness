@@ -6,6 +6,30 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.1.1 — 2026-09-11
+
+### 中文
+
+- 应用图标换成官方 Grok 标志。
+- 自动批准、记住批准、批准条默认项移入设置；对话栏用一个选择器同时改模型和思考长度。
+- 顶栏工作目录比会话标题更淡；执行中的对话在侧栏、顶栏和等待回复时显示 loading。
+- 侧栏加宽 20px；滚动条 2px；按钮和折叠箭头略放大，展开/折叠带过渡。
+- 分组排序和展开状态每次操作写入本地，下次启动还原。
+- 额度从 `/usage`（`x.ai/billing`）读取，启动时同步，之后每 5 分钟刷新。
+- 设置按钮放到左下信息栏（头像右侧）；账号弹出层点内部不再收起。
+
+### English
+
+- App icon is the official Grok mark.
+- Auto-approve, remember-approvals, and the permission-bar default move to Settings; model and thinking length share one composer control.
+- Workspace path in the top bar is fainter than the session title; running chats show a spinner in the sidebar, top bar, and while waiting for a reply.
+- Sidebar is 20px wider; scrollbars are 2px; buttons and fold chevrons are slightly larger, with expand/collapse motion.
+- Group sort and collapsed/expanded state persist on every change and restore on launch.
+- Quota comes from `/usage` (`x.ai/billing`), synced on startup and every 5 minutes.
+- Settings sits in the account bar to the right of the avatar; the account popover stays open when clicking inside it.
+
+---
+
 ## 0.1.0 — 2026-09-11
 
 ### 中文

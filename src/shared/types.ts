@@ -101,6 +101,8 @@ export type QuotaInfo = {
   plan?: string;
   resetAt?: string;
   extraCredits?: string;
+  period?: string;
+  syncedAt?: number;
 };
 
 export type AccountInfo = {
@@ -127,6 +129,17 @@ export function parseGroupSort(value: unknown): GroupSort {
 
 export function parseSessionSort(value: unknown): SessionSort {
   return typeof value === "string" && (SESSION_SORTS as string[]).includes(value) ? (value as SessionSort) : "recent";
+}
+
+export function normalizeGroupKey(cwd?: string | null): string {
+  const raw = (cwd ?? "").trim();
+  if (!raw) return "(unknown)";
+  if (raw.startsWith("__")) return raw;
+  if (raw === "(unknown)") return raw;
+  let key = raw.replace(/\//g, "\\");
+  while (key.length > 3 && key.endsWith("\\")) key = key.slice(0, -1);
+  if (/^[a-zA-Z]:/.test(key)) key = key[0].toUpperCase() + key.slice(1);
+  return key;
 }
 
 export type ModelInfo = {
@@ -166,6 +179,7 @@ export type AppSnapshot = {
   sidebarCollapsed: boolean;
   inspectorOpen: boolean;
   collapsedGroups: string[];
+  hiddenGroups: string[];
   groupSort: GroupSort;
   sessionSort: SessionSort;
   account: AccountInfo;

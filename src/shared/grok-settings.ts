@@ -218,6 +218,35 @@ export const SETTINGS_SECTIONS: { title: string; fields: SettingsField[] }[] = [
     title: "权限与批准",
     fields: [
       {
+        key: "permissionMode",
+        kind: "select",
+        label: "权限模式",
+        hint: "询问先确认敏感操作；自动放过安全操作；自动批准不再询问。",
+        options: [
+          { value: "ask", label: "询问" },
+          { value: "auto", label: "自动" },
+          { value: "always-approve", label: "自动批准" },
+        ],
+      },
+      {
+        key: "rememberToolApprovals",
+        kind: "toggle",
+        label: "记住批准",
+        hint: "把本次工具批准记下来，后续同类操作不再问。",
+      },
+      {
+        key: "defaultSelectedPermission",
+        kind: "select",
+        label: "批准条默认项",
+        hint: "弹出批准条时默认选中的项，例如始终允许。",
+        options: [
+          { value: "always_allow_all_sessions", label: "始终允许" },
+          { value: "allow_command_always", label: "允许该命令" },
+          { value: "allow_once", label: "仅一次" },
+          { value: "reject", label: "拒绝" },
+        ],
+      },
+      {
         key: "askQuestionTimeoutEnabled",
         kind: "toggle",
         label: "Ask-Question 超时",

@@ -15,13 +15,13 @@ import type {
   TimelineItem,
   ToolDiff,
 } from "../shared/types";
-import { parseGroupSort, parseSessionSort } from "../shared/types";
+import { normalizeGroupKey, parseGroupSort, parseSessionSort } from "../shared/types";
 import { resolveGrokBinary } from "./resolve-binary";
 import { startGrokServe, stopGrokServe, type ServeHandle } from "./grok-process";
 import { listLocalSessions, purgeSession, sanitizeSessionTitle, writeSessionTitle } from "./session-store";
 import { loadSessionTranscript } from "./session-transcript";
 import { LocalDb } from "./local-db";
-import { fetchQuota, loadAccountSeed } from "./account";
+import { fetchQuota, loadAccountSeed, parseUsagePayload } from "./account";
 import { mergeSlashCommands, parseSlashCommands } from "../shared/slash";
 import { normalizeUserText } from "../shared/message-text";
 import { readEventStats, touchStats, type StatsCursor } from "../shared/step-stats";
@@ -117,6 +117,7 @@ export class AgentHost {
   private db = new LocalDb();
   private listeners = new Set<(event: AgentUiEvent) => void>();
   private hydrating = false;
+  private accountRefreshing = false;
   private statsCursor: StatsCursor = {};
   private permissionWaiters = new Map<
     string,
@@ -134,6 +135,7 @@ export class AgentHost {
     inspectorOpen: false,
     inspectorWidth: 320,
     collapsedGroups: [],
+    hiddenGroups: [],
     groupSort: "recent",
     sessionSort: "recent",
     account: { connection: "idle" },
@@ -193,9 +195,10 @@ export class AgentHost {
       sidebarCollapsed: this.db.getBool("sidebarCollapsed", false),
       inspectorOpen: this.db.getBool("inspectorOpen", false),
       inspectorWidth: clampInspectorWidth(this.db.getNumber("inspectorWidth", 320)),
-      collapsedGroups: this.db.getJson<string[]>("collapsedGroups", []),
-      groupSort: parseGroupSort(this.db.getKv("groupSort")),
-      sessionSort: parseSessionSort(this.db.getKv("sessionSort")),
+      collapsedGroups: this.readCollapsedGroups(),
+      hiddenGroups: this.readHiddenGroups(),
+      groupSort: parseGroupSort(this.readSidebarPrefs()?.groupSort ?? this.db.getKv("groupSort")),
+      sessionSort: parseSessionSort(this.readSidebarPrefs()?.sessionSort ?? this.db.getKv("sessionSort")),
       alwaysApprove: this.db.getBool("alwaysApprove", false),
       sessionMode: (this.db.getKv("lastMode") as SessionMode | undefined) ?? "ask",
       workspace: this.db.getKv("lastWorkspace"),
@@ -210,6 +213,7 @@ export class AgentHost {
     await this.loadLocalSessions();
     void this.refreshAccount();
     void this.refreshUpdate();
+    setInterval(() => void this.refreshAccount(), 5 * 60_000);
     setInterval(() => void this.refreshUpdate(), 30 * 60_000);
     void this.ensureConnected().catch((err) => {
       console.error("auto-connect failed", err);
@@ -220,14 +224,16 @@ export class AgentHost {
     const settings = settingsFromToml(loadGrokToml());
     const alwaysApprove = settings.permissionMode === "always-approve";
     this.db.setKv("alwaysApprove", alwaysApprove ? "1" : "0");
-    if (settings.defaultModel) this.db.setKv("lastModelId", settings.defaultModel);
-    if (settings.defaultEffort) this.db.setKv("lastEffort", settings.defaultEffort);
     this.patch({
       settings,
       alwaysApprove,
-      sessionMode: alwaysApprove ? "yolo" : settings.permissionMode === "auto" ? "auto" : "ask",
-      modelId: settings.defaultModel || this.snapshot.modelId,
-      effort: settings.defaultEffort || this.snapshot.effort,
+      sessionMode: alwaysApprove
+        ? "yolo"
+        : settings.permissionMode === "auto"
+          ? "auto"
+          : this.snapshot.sessionMode === "plan"
+            ? "plan"
+            : "ask",
     });
     return settings;
   }
@@ -237,7 +243,35 @@ export class AgentHost {
     const table = loadGrokToml();
     applySetting(table, key, value);
     saveGrokToml(table);
-    return this.reloadGrokSettings();
+    const settings = this.reloadGrokSettings();
+    if (key === "defaultModel" && typeof value === "string" && value.trim()) {
+      this.db.setKv("lastModelId", value);
+      const named = this.snapshot.models.find((model) => model.modelId === value);
+      this.patch({ modelId: value, modelName: named?.name ?? value });
+      void this.setConfigOption("model", value);
+    }
+    if (key === "defaultEffort" && typeof value === "string" && value.trim()) {
+      this.db.setKv("lastEffort", value);
+      this.patch({ effort: value });
+      void this.setConfigOption("reasoning_effort", value);
+    }
+    return settings;
+  }
+
+  async setModelEffort(modelId: string, effort?: string): Promise<void> {
+    const id = modelId.trim();
+    const nextEffort = effort?.trim();
+    if (id) {
+      this.db.setKv("lastModelId", id);
+      const named = this.snapshot.models.find((model) => model.modelId === id);
+      this.patch({ modelId: id, modelName: named?.name ?? this.snapshot.modelName });
+      await this.setConfigOption("model", id);
+    }
+    if (nextEffort) {
+      this.db.setKv("lastEffort", nextEffort);
+      this.patch({ effort: nextEffort });
+      await this.setConfigOption("reasoning_effort", nextEffort);
+    }
   }
 
   async refreshUpdate(): Promise<void> {
@@ -409,9 +443,7 @@ export class AgentHost {
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
     this.db.setArchived(sessionId, archived);
     if (archived && this.snapshot.collapsedGroups.includes("__archived__")) {
-      const collapsedGroups = this.snapshot.collapsedGroups.filter((key) => key !== "__archived__");
-      this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
-      this.patch({ collapsedGroups });
+      this.setCollapsedGroups(this.snapshot.collapsedGroups.filter((key) => key !== "__archived__"));
     }
     await this.loadLocalSessions();
   }
@@ -478,6 +510,7 @@ export class AgentHost {
   setWorkspace(folder: string): void {
     const next = folder.trim();
     this.db.setKv("lastWorkspace", next);
+    if (next) this.revealWorkspace(next);
     if (!this.snapshot.sessionId) this.patch({ workspace: next || undefined });
   }
 
@@ -488,7 +521,10 @@ export class AgentHost {
     } catch (err) {
       this.fail(err instanceof Error ? err.message : String(err));
     }
-    if (nextWorkspace) this.db.setKv("lastWorkspace", nextWorkspace);
+    if (nextWorkspace) {
+      this.db.setKv("lastWorkspace", nextWorkspace);
+      this.revealWorkspace(nextWorkspace);
+    }
     this.patch({
       sessionId: undefined,
       sessionTitle: "新对话",
@@ -504,35 +540,132 @@ export class AgentHost {
   }
 
   toggleGroup(cwd: string): void {
+    const key = normalizeGroupKey(cwd);
     const set = new Set(this.snapshot.collapsedGroups);
-    if (set.has(cwd)) set.delete(cwd);
-    else set.add(cwd);
+    if (set.has(key)) set.delete(key);
+    else set.add(key);
     this.setCollapsedGroups([...set]);
   }
 
   setCollapsedGroups(keys: string[]): void {
-    const collapsedGroups = [...new Set(keys.map((key) => String(key)).filter(Boolean))];
-    this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
+    const collapsedGroups = this.uniqueKeys(keys);
+    this.writeSidebarPrefs({ collapsedGroups });
     this.patch({ collapsedGroups });
+  }
+
+  setHiddenGroups(keys: string[]): void {
+    const hiddenGroups = this.uniqueKeys(keys);
+    this.db.setKv("hiddenGroups", JSON.stringify(hiddenGroups));
+    this.patch({ hiddenGroups });
+  }
+
+  hideWorkspace(key: string): void {
+    const id = String(key ?? "").trim();
+    if (!id || id === "__pinned__" || id === "__archived__") return;
+    this.setHiddenGroups([...this.snapshot.hiddenGroups, id]);
+  }
+
+  revealWorkspace(key: string): void {
+    const id = String(key ?? "").trim();
+    if (!id) return;
+    if (!this.snapshot.hiddenGroups.includes(id)) return;
+    this.setHiddenGroups(this.snapshot.hiddenGroups.filter((item) => item !== id));
+  }
+
+  async deleteWorkspace(cwd: string): Promise<void> {
+    const target = cwd.trim();
+    if (!target) return;
+    const ids = this.snapshot.sessions
+      .filter((session) => (session.cwd?.trim() || "(unknown)") === target)
+      .map((session) => session.sessionId);
+    for (const sessionId of ids) {
+      await this.deleteSession(sessionId);
+    }
+    this.revealWorkspace(target);
+    if (this.snapshot.workspace?.trim() === target) {
+      this.db.setKv("lastWorkspace", "");
+      if (!this.snapshot.sessionId) this.patch({ workspace: undefined });
+    }
   }
 
   setSidebarSort(groupSort?: GroupSort, sessionSort?: SessionSort): void {
     const nextGroup = parseGroupSort(groupSort ?? this.snapshot.groupSort);
     const nextSession = parseSessionSort(sessionSort ?? this.snapshot.sessionSort);
-    this.db.setKv("groupSort", nextGroup);
-    this.db.setKv("sessionSort", nextSession);
+    this.writeSidebarPrefs({ groupSort: nextGroup, sessionSort: nextSession });
     this.patch({ groupSort: nextGroup, sessionSort: nextSession });
   }
 
+  private uniqueKeys(keys: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of keys) {
+      const trimmed = String(raw ?? "").trim();
+      if (!trimmed) continue;
+      const key = normalizeGroupKey(trimmed);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(key);
+    }
+    return out;
+  }
+
+  private readSidebarPrefs(): { collapsedGroups?: string[]; groupSort?: string; sessionSort?: string } | undefined {
+    return this.db.getJson("sidebarPrefs", undefined);
+  }
+
+  private readCollapsedGroups(): string[] {
+    const fromPrefs = this.readSidebarPrefs()?.collapsedGroups;
+    const raw = Array.isArray(fromPrefs) ? fromPrefs : this.db.getJson<string[]>("collapsedGroups", []);
+    return this.uniqueKeys(Array.isArray(raw) ? raw : []);
+  }
+
+  private readHiddenGroups(): string[] {
+    return this.uniqueKeys(this.db.getJson<string[]>("hiddenGroups", []));
+  }
+
+  private writeSidebarPrefs(partial: { collapsedGroups?: string[]; groupSort?: GroupSort; sessionSort?: SessionSort }): void {
+    const collapsedGroups = partial.collapsedGroups ?? this.snapshot.collapsedGroups;
+    const groupSort = partial.groupSort ?? this.snapshot.groupSort;
+    const sessionSort = partial.sessionSort ?? this.snapshot.sessionSort;
+    const prefs = { collapsedGroups, groupSort, sessionSort };
+    this.db.setKv("sidebarPrefs", JSON.stringify(prefs));
+    this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
+    this.db.setKv("groupSort", groupSort);
+    this.db.setKv("sessionSort", sessionSort);
+  }
+
   async refreshAccount(): Promise<void> {
-    const quota = await fetchQuota();
-    this.patch({
-      account: {
-        ...this.snapshot.account,
-        plan: quota?.plan ?? this.snapshot.account.plan,
-        quota,
-      },
-    });
+    if (this.accountRefreshing) return;
+    this.accountRefreshing = true;
+    try {
+      const quota = (await this.fetchUsage()) ?? this.snapshot.account.quota;
+      this.patch({
+        account: {
+          ...this.snapshot.account,
+          plan: quota?.plan ?? this.snapshot.account.plan,
+          quota,
+        },
+      });
+    } finally {
+      this.accountRefreshing = false;
+    }
+  }
+
+  private async fetchUsage() {
+    if (this.client?.connected) {
+      const methods = ["_x.ai/billing", "x.ai/billing"];
+      for (const method of methods) {
+        try {
+          const result = await this.client.request(method, {}, 15_000);
+          if (result === ABSORBED_BY_STREAM) continue;
+          const quota = parseUsagePayload(result);
+          if (quota) return quota;
+        } catch {
+          /* try the next spelling, then HTTP */
+        }
+      }
+    }
+    return fetchQuota();
   }
 
   private async ensureConnected(alwaysApprove = this.snapshot.alwaysApprove): Promise<AcpClient> {
@@ -569,7 +702,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.1.0" },
+        clientInfo: { name: "grok-harness", version: "0.1.1" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
@@ -626,6 +759,7 @@ export class AgentHost {
     const alwaysApprove = mode === "yolo";
     this.statsCursor = {};
     this.db.setKv("lastWorkspace", workspace);
+    this.revealWorkspace(workspace);
     this.db.setKv("lastMode", mode);
     if (opts.modelId) this.db.setKv("lastModelId", opts.modelId);
     if (opts.effort) this.db.setKv("lastEffort", opts.effort);

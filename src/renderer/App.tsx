@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,15 +7,16 @@ import type {
   AppSnapshot,
   GroupSort,
   PermissionRequest,
-  SessionMode,
   SessionSort,
   SessionSummary,
   SlashCommand,
   TimelineItem,
 } from "../shared/types";
+import { normalizeGroupKey } from "../shared/types";
 import { CodeView, prettyUnknown } from "./CodeView";
 import { aggregateStats, formatStepStats } from "../shared/step-stats";
 import { GROK_SETTINGS_DEFAULTS } from "../shared/grok-settings";
+import { ModelEffortPicker } from "./ModelEffortPicker";
 import { SettingsPanel } from "./SettingsPanel";
 import { UpdatePanel } from "./UpdatePanel";
 
@@ -31,6 +32,7 @@ const empty: AppSnapshot = {
   inspectorOpen: false,
   inspectorWidth: 320,
   collapsedGroups: [],
+  hiddenGroups: [],
   groupSort: "recent",
   sessionSort: "recent",
   account: { connection: "idle" },
@@ -51,85 +53,18 @@ const SESSION_SORT_OPTIONS: { id: SessionSort; label: string }[] = [
   { id: "title-desc", label: "名称 Z→A" },
 ];
 
-const MODE_OPTIONS: { id: SessionMode; label: string; hint: string }[] = [
-  { id: "ask", label: "询问", hint: "敏感操作先问你" },
-  { id: "auto", label: "自动", hint: "安全操作自动过" },
-  { id: "yolo", label: "自动批准", hint: "不再询问" },
-  { id: "plan", label: "计划", hint: "先出方案再改代码" },
-];
-
-const PERMISSION_DEFAULT_OPTIONS: { value: string; label: string }[] = [
-  { value: "always_allow_all_sessions", label: "始终允许" },
-  { value: "allow_command_always", label: "允许该命令" },
-  { value: "allow_once", label: "仅一次" },
-  { value: "reject", label: "拒绝" },
-];
-
-function PermissionChips({
-  mode,
-  rememberApprovals,
-  defaultSelected,
-  onMode,
-  onRemember,
-  onDefaultSelected,
-}: {
-  mode: SessionMode;
-  rememberApprovals: boolean;
-  defaultSelected: string;
-  onMode: (mode: SessionMode) => void;
-  onRemember: (value: boolean) => void;
-  onDefaultSelected: (value: string) => void;
-}) {
+function Spinner({ size = 12 }: { size?: number }) {
   return (
-    <>
-      <select
-        className="chip"
-        title="权限模式"
-        value={mode}
-        onChange={(event) => onMode(event.target.value as SessionMode)}
-      >
-        {MODE_OPTIONS.map((option) => (
-          <option key={option.id} value={option.id} title={option.hint}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-      <select
-        className="chip"
-        title="记住工具批准"
-        value={rememberApprovals ? "1" : "0"}
-        onChange={(event) => onRemember(event.target.value === "1")}
-      >
-        <option value="1">记住批准</option>
-        <option value="0">不记住</option>
-      </select>
-      <select
-        className="chip"
-        title="首次批准默认项"
-        value={defaultSelected}
-        onChange={(event) => onDefaultSelected(event.target.value)}
-      >
-        {PERMISSION_DEFAULT_OPTIONS.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </>
+    <svg className="spin" width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="6" stroke="currentColor" strokeOpacity="0.22" strokeWidth="2" />
+      <path d="M14 8a6 6 0 0 0-6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
   );
 }
 
-const EFFORT_LABEL: Record<string, string> = {
-  minimal: "minimal",
-  low: "low",
-  medium: "medium",
-  high: "high",
-  xhigh: "xhigh",
-};
-
 function SendIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M8 3.2v9.6M3.75 7.45 8 3.2l4.25 4.25"
         stroke="currentColor"
@@ -143,7 +78,7 @@ function SendIcon() {
 
 function StopIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="4.15" y="4.15" width="7.7" height="7.7" rx="1.7" fill="currentColor" />
     </svg>
   );
@@ -151,7 +86,7 @@ function StopIcon() {
 
 function ExpandAllIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M3.2 5.2 8 10l4.8-4.8M3.2 9.2 8 14l4.8-4.8"
         stroke="currentColor"
@@ -165,7 +100,7 @@ function ExpandAllIcon() {
 
 function CollapseAllIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M3.2 6.8 8 2l4.8 4.8M3.2 10.8 8 6l4.8 4.8"
         stroke="currentColor"
@@ -179,7 +114,7 @@ function CollapseAllIcon() {
 
 function SortIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M4 5h8M4 8h5.5M4 11h3"
         stroke="currentColor"
@@ -190,9 +125,38 @@ function SortIcon() {
   );
 }
 
+function FoldChevron({ open = false }: { open?: boolean }) {
+  return (
+    <svg
+      className={`chevron ${open ? "open" : ""}`}
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M4.2 2.2 8.4 6 4.2 9.8"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function Fold({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
+  return (
+    <div className={`fold ${collapsed ? "collapsed" : ""}`}>
+      <div className="fold-inner">{children}</div>
+    </div>
+  );
+}
+
 function PinIcon({ filled = false }: { filled?: boolean }) {
   return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M9.8 2.4 13.6 6.2c.3.3.3.8 0 1.1l-1.2 1.2-1.8-.3-2.4 2.4v2.2L6.6 11.2 3.2 14.6 1.4 12.8l3.4-3.4L3.2 7.8h2.2l2.4-2.4-.3-1.8 1.2-1.2c.3-.3.8-.3 1.1 0Z"
         fill={filled ? "currentColor" : "none"}
@@ -366,6 +330,7 @@ function TimelineItemView({
     return (
       <details className="thought-block" {...(item.streaming ? { open: true } : {})}>
         <summary>
+          <FoldChevron />
           <span>{item.streaming ? "正在思考" : "思考过程"}</span>
           <Stamp at={item.at} show={showTimestamps} />
         </summary>
@@ -434,6 +399,7 @@ function OpTree({
   return (
     <details className="op-tree" {...(block.streaming ? { open: true } : {})}>
       <summary>
+        <FoldChevron />
         <span className={`op-dot ${block.streaming ? "live" : ""}`} />
         <span className="op-tree-title">{block.title}</span>
         <span className="op-tree-count">
@@ -447,6 +413,7 @@ function OpTree({
               <li key={item.id} className="op-step thought">
                 <details {...(item.streaming ? { open: true } : {})}>
                   <summary>
+                    <FoldChevron />
                     <span>{item.streaming ? "正在思考" : "思考"}</span>
                     <StepMeta item={item} live={item.streaming} />
                   </summary>
@@ -477,6 +444,7 @@ function OpTree({
               <li key={item.id} className="op-step thought">
                 <details>
                   <summary>
+                    <FoldChevron />
                     <span>计划</span>
                     <StepMeta item={item} />
                   </summary>
@@ -499,6 +467,7 @@ function OpTree({
 
 function TimelineView({
   items,
+  busy,
   selectedId,
   onSelectTool,
   showThoughts = true,
@@ -521,6 +490,7 @@ function TimelineView({
     () => (groupTools ? groupTimeline(visible) : visible.map((item) => ({ type: "single" as const, item }))),
     [visible, groupTools],
   );
+  const waiting = Boolean(busy) && !visible.some(isLiveItem);
   return (
     <>
       {blocks.map((block) => {
@@ -545,6 +515,12 @@ function TimelineView({
           </div>
         );
       })}
+      {waiting ? (
+        <div className="turn-loading" aria-live="polite">
+          <Spinner />
+          <span>正在执行</span>
+        </div>
+      ) : null}
     </>
   );
 }
@@ -599,6 +575,7 @@ function Inspector({
         return (
           <details className="diff" key={diff.path}>
             <summary className="path">
+              <FoldChevron />
               {diff.path} +{added} / -{removed}
             </summary>
             {body}
@@ -671,6 +648,7 @@ function PermissionBar({
 function SessionRow({
   session,
   active,
+  busy,
   menuOpen,
   renaming,
   onOpen,
@@ -682,6 +660,7 @@ function SessionRow({
 }: {
   session: SessionSummary;
   active: boolean;
+  busy?: boolean;
   menuOpen: boolean;
   renaming: boolean;
   onOpen: () => void;
@@ -723,7 +702,8 @@ function SessionRow({
 
   return (
     <div
-      className={`session-row ${active ? "active" : ""} ${menuOpen ? "menu-open" : ""} ${renaming ? "renaming" : ""}`}
+      className={`session-row ${active ? "active" : ""} ${busy ? "busy" : ""} ${menuOpen ? "menu-open" : ""} ${renaming ? "renaming" : ""}`}
+      aria-busy={busy || undefined}
       onContextMenu={onMenu}
     >
       {renaming ? (
@@ -755,7 +735,7 @@ function SessionRow({
         <button
           className="session-open"
           type="button"
-          title={session.title || "未命名对话"}
+          title={busy ? "执行中" : session.title || "未命名对话"}
           onClick={() => {
             clearTimeout(openTimer.current);
             openTimer.current = setTimeout(() => onOpen(), 280);
@@ -770,7 +750,13 @@ function SessionRow({
           <span className="session-title">
             <span className="session-title-text">{session.title || "未命名对话"}</span>
             {session.interrupted ? <span className="interrupt-chip" title="更新时中断">中断</span> : null}
-            {session.unread ? <span className="unread-dot" title="未读" /> : null}
+            {busy ? (
+              <span className="session-spinner" title="执行中">
+                <Spinner />
+              </span>
+            ) : session.unread ? (
+              <span className="unread-dot" title="未读" />
+            ) : null}
           </span>
           <small>{formatAgo(session.updatedAtMs ?? session.updatedAt)}</small>
         </button>
@@ -883,9 +869,6 @@ export function App() {
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const [draftWorkspace, setDraftWorkspace] = useState("");
-  const [draftModel, setDraftModel] = useState("");
-  const [draftEffort, setDraftEffort] = useState("high");
-  const [draftMode, setDraftMode] = useState<SessionMode>("ask");
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [renamingId, setRenamingId] = useState<string | undefined>();
   const inspectorWidthRef = useRef(320);
@@ -910,29 +893,14 @@ export function App() {
     void window.grok.getState().then((snap) => {
       setState(snap);
       setDraftWorkspace(snap.workspace ?? "");
-      setDraftModel(snap.modelId ?? snap.models[0]?.modelId ?? "");
-      setDraftEffort(snap.effort ?? "high");
-      setDraftMode(snap.sessionMode ?? "ask");
       setInspectorWidth(snap.inspectorWidth || 320);
     });
     return unsub;
   }, []);
 
   useEffect(() => {
-    if (state.sessionId) return;
-    if (state.modelId && !draftModel) setDraftModel(state.modelId);
-    if (state.effort && draftEffort === "high") setDraftEffort(state.effort);
     if (state.inspectorWidth) setInspectorWidth(state.inspectorWidth);
-  }, [state.modelId, state.effort, state.sessionId, state.inspectorWidth, draftModel, draftEffort]);
-
-  useEffect(() => {
-    setDraftMode(state.sessionMode);
-  }, [state.settings.permissionMode, state.sessionMode]);
-
-  function applyMode(mode: SessionMode) {
-    setDraftMode(mode);
-    void window.grok.setSessionMode(mode).then(setState);
-  }
+  }, [state.inspectorWidth]);
 
   const lastTimeline = state.timeline[state.timeline.length - 1];
   const timelineTail =
@@ -964,22 +932,18 @@ export function App() {
 
   useEffect(() => {
     if (!accountOpen) return;
-    const closeIfOutside = (node: EventTarget | null) => {
+    const onPointerDown = (event: PointerEvent) => {
       const dock = accountDockRef.current;
-      if (!dock || !(node instanceof Node) || dock.contains(node)) return;
+      if (!dock || !(event.target instanceof Node) || dock.contains(event.target)) return;
       setAccountOpen(false);
     };
-    const onPointerDown = (event: PointerEvent) => closeIfOutside(event.target);
-    const onFocusIn = (event: FocusEvent) => closeIfOutside(event.target);
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") setAccountOpen(false);
     };
     window.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("focusin", onFocusIn);
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("focusin", onFocusIn);
       window.removeEventListener("keydown", onKey);
     };
   }, [accountOpen]);
@@ -1024,9 +988,6 @@ export function App() {
       const snap = await window.grok.beginNewChat(workspace);
       setState(snap);
       setDraftWorkspace(workspace || snap.workspace || "");
-      setDraftModel(snap.modelId ?? snap.models[0]?.modelId ?? draftModel);
-      setDraftEffort(snap.effort ?? draftEffort);
-      setDraftMode(snap.sessionMode ?? draftMode);
     } catch (err) {
       setBusyError(err instanceof Error ? err.message : String(err));
     }
@@ -1154,9 +1115,9 @@ export function App() {
         }
         await window.grok.start(workspace, {
           workspace,
-          mode: draftMode,
-          modelId: draftModel || undefined,
-          effort: draftEffort || undefined,
+          mode: state.sessionMode,
+          modelId: state.modelId || undefined,
+          effort: state.effort || undefined,
         });
       }
       setState(await window.grok.send(text));
@@ -1234,9 +1195,18 @@ export function App() {
     ),
     [state.sessions, state.sessionSort],
   );
-  const liveGroups = useMemo(
+  const allLiveGroups = useMemo(
     () => buildGroups(liveSessions, state.groupSort, state.sessionSort),
     [liveSessions, state.groupSort, state.sessionSort],
+  );
+  const hiddenKeySet = useMemo(() => new Set(state.hiddenGroups), [state.hiddenGroups]);
+  const liveGroups = useMemo(
+    () => allLiveGroups.filter((group) => group.key === "__pinned__" || !hiddenKeySet.has(group.key)),
+    [allLiveGroups, hiddenKeySet],
+  );
+  const hiddenWorkspaceGroups = useMemo(
+    () => allLiveGroups.filter((group) => hiddenKeySet.has(group.key)),
+    [allLiveGroups, hiddenKeySet],
   );
   const archivedGroup: SessionGroup = {
     key: "__archived__",
@@ -1249,11 +1219,12 @@ export function App() {
     menu?.kind === "group"
       ? menu.id === "__archived__"
         ? archivedGroup
-        : liveGroups.find((group) => group.key === menu.id) ??
-          liveGroups.flatMap((group) => group.nested ?? []).find((group) => group.key === menu.id)
+        : allLiveGroups.find((group) => group.key === menu.id) ??
+          allLiveGroups.flatMap((group) => group.nested ?? []).find((group) => group.key === menu.id)
       : undefined;
   const currentSession = state.sessions.find((session) => session.sessionId === state.sessionId);
   const archivedCollapsed = state.collapsedGroups.includes("__archived__");
+  const hiddenCollapsed = state.collapsedGroups.includes("__hidden__");
   const sessionMenuItems: MenuEntry[] = menuSession
     ? [
         {
@@ -1347,6 +1318,34 @@ export function App() {
             void window.grok.toggleGroup(menuGroup.key).then(setState);
           },
         },
+        ...(menuGroup.cwd
+          ? [
+              {
+                type: "item" as const,
+                id: "hide",
+                label: hiddenKeySet.has(menuGroup.key) ? "取消隐藏" : "隐藏工作区",
+                onClick: () => {
+                  setMenu(undefined);
+                  void (
+                    hiddenKeySet.has(menuGroup.key)
+                      ? window.grok.revealWorkspace(menuGroup.key)
+                      : window.grok.hideWorkspace(menuGroup.key)
+                  ).then(setState);
+                },
+              },
+              { type: "sep" as const, id: "sep-hide" },
+              {
+                type: "item" as const,
+                id: "delete-workspace",
+                label: "删除工作区",
+                danger: true,
+                onClick: () => {
+                  setMenu(undefined);
+                  void window.grok.deleteWorkspace(menuGroup.key).then(setState);
+                },
+              },
+            ]
+          : []),
       ]
     : [];
   const sortMenuItems: MenuEntry[] = [
@@ -1383,8 +1382,6 @@ export function App() {
   ]
     .filter(Boolean)
     .join(" ");
-  const selectedModel = state.models.find((model) => model.modelId === draftModel) ?? state.models[0];
-  const effortChoices = selectedModel?.efforts?.length ? selectedModel.efforts : ["low", "medium", "high", "xhigh"];
   const home = !state.sessionId;
 
   return (
@@ -1397,30 +1394,34 @@ export function App() {
           <button className="icon-btn" type="button" title="添加对话" onClick={() => void beginNew()}>
             +
           </button>
-          <button className="icon-btn" type="button" title="设置" onClick={() => setSettingsOpen(true)}>
-            ⚙
-          </button>
-          {state.update?.updateAvailable ? (
+          <div className="rail-foot">
             <button
-              className="update-proto rail-update"
+              className="icon-btn"
               type="button"
-              title={`更新到 ${state.update.latestVersion}`}
-              onClick={() => {
-                setChangelogOpen(true);
-                void window.grok.checkUpdate().then(setState);
-              }}
+              title="设置"
+              onClick={() => setSettingsOpen(true)}
             >
-              更新
+              ⚙
             </button>
-          ) : null}
+            {state.update?.updateAvailable ? (
+              <button
+                className="update-proto rail-update"
+                type="button"
+                title={`更新到 ${state.update.latestVersion}`}
+                onClick={() => {
+                  setChangelogOpen(true);
+                  void window.grok.checkUpdate().then(setState);
+                }}
+              >
+                更新
+              </button>
+            ) : null}
+          </div>
         </aside>
       ) : (
         <aside className="sidebar pane">
           <div className="sidebar-head">
             <span className="brand-mark">Grok-Harness</span>
-            <button className="icon-btn" type="button" title="设置" onClick={() => setSettingsOpen(true)}>
-              ⚙
-            </button>
             <button className="icon-btn" type="button" title="收起侧栏" onClick={() => void window.grok.setSidebarCollapsed(true)}>
               ‹
             </button>
@@ -1449,6 +1450,7 @@ export function App() {
                   onClick={() => {
                     const keys = [
                       ...liveGroups.flatMap((group) => [group.key, ...(group.nested?.map((child) => child.key) ?? [])]),
+                      ...(hiddenWorkspaceGroups.length ? ["__hidden__"] : []),
                       ...(archivedSessions.length ? ["__archived__"] : []),
                     ];
                     void window.grok.setCollapsedGroups(keys).then(setState);
@@ -1488,7 +1490,7 @@ export function App() {
               return (
                 <section className={`session-group ${group.key === "__pinned__" ? "pinned" : ""}`} key={group.key}>
                   <header
-                    className="session-group-head"
+                    className={`session-group-head ${menu?.kind === "group" && menu.id === group.key ? "menu-open" : ""}`}
                     onMouseEnter={(event) => showGroupHover(event, group)}
                     onMouseLeave={hideGroupHover}
                     onContextMenu={(event) => placeMenu(event, { kind: "group", id: group.key })}
@@ -1496,9 +1498,9 @@ export function App() {
                     <button
                       className="session-group-toggle"
                       type="button"
-                      onClick={() => void window.grok.toggleGroup(group.key)}
+                      onClick={() => void window.grok.toggleGroup(group.key).then(setState)}
                     >
-                      <span className="chevron">{isCollapsed ? "▸" : "▾"}</span>
+                      <FoldChevron open={!isCollapsed} />
                       <span className="session-group-copy">
                         <strong>{group.label}</strong>
                       </span>
@@ -1509,80 +1511,137 @@ export function App() {
                         +
                       </button>
                     )}
+                    {group.cwd ? (
+                      <button
+                        className="kebab"
+                        type="button"
+                        title="工作区操作"
+                        onClick={(event) => placeMenu(event, { kind: "group", id: group.key })}
+                      >
+                        ⋯
+                      </button>
+                    ) : null}
                   </header>
-                  {!isCollapsed && nested.length > 0
-                    ? nested.map((child) => {
-                        const childCollapsed = state.collapsedGroups.includes(child.key);
-                        return (
-                          <div className="session-subgroup" key={child.key}>
-                            <header
-                              className="session-group-head"
-                              onMouseEnter={(event) => showGroupHover(event, child)}
-                              onMouseLeave={hideGroupHover}
-                              onContextMenu={(event) => placeMenu(event, { kind: "group", id: child.key })}
-                            >
-                              <button
-                                className="session-group-toggle"
-                                type="button"
-                                onClick={() => void window.grok.toggleGroup(child.key)}
+                  <Fold collapsed={isCollapsed}>
+                    {nested.length > 0
+                      ? nested.map((child) => {
+                          const childCollapsed = state.collapsedGroups.includes(child.key);
+                          return (
+                            <div className="session-subgroup" key={child.key}>
+                              <header
+                                className="session-group-head"
+                                onMouseEnter={(event) => showGroupHover(event, child)}
+                                onMouseLeave={hideGroupHover}
+                                onContextMenu={(event) => placeMenu(event, { kind: "group", id: child.key })}
                               >
-                                <span className="chevron">{childCollapsed ? "▸" : "▾"}</span>
-                                <span className="session-group-copy">
-                                  <strong>{child.label}</strong>
-                                </span>
-                                <span className="session-count">{child.sessions.length}</span>
-                              </button>
-                              {child.cwd && (
                                 <button
-                                  className="btn tiny"
+                                  className="session-group-toggle"
                                   type="button"
-                                  title="在此目录新建会话"
-                                  onClick={() => void startIn(child.cwd!)}
+                                  onClick={() => void window.grok.toggleGroup(child.key).then(setState)}
                                 >
-                                  +
+                                  <FoldChevron open={!childCollapsed} />
+                                  <span className="session-group-copy">
+                                    <strong>{child.label}</strong>
+                                  </span>
+                                  <span className="session-count">{child.sessions.length}</span>
                                 </button>
-                              )}
-                            </header>
-                            {!childCollapsed &&
-                              child.sessions.map((session) => (
-                                <SessionRow
-                                  key={session.sessionId}
-                                  session={session}
-                                  active={session.sessionId === state.sessionId}
-                                  menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
-                                  renaming={renamingId === session.sessionId}
-                                  onOpen={() => void openSession(session)}
-                                  onPin={(event) => void pinSession(event, session)}
-                                  onMenu={(event) => placeMenu(event, { kind: "session", id: session.sessionId })}
-                                  onStartRename={() => setRenamingId(session.sessionId)}
-                                  onRename={(title) => void renameSession(session, title)}
-                                  onCancelRename={() => setRenamingId(undefined)}
-                                />
-                              ))}
-                          </div>
-                        );
-                      })
-                    : null}
-                  {!isCollapsed && nested.length === 0
-                    ? group.sessions.map((session) => (
-                        <SessionRow
-                          key={session.sessionId}
-                          session={session}
-                          active={session.sessionId === state.sessionId}
-                          menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
-                          renaming={renamingId === session.sessionId}
-                          onOpen={() => void openSession(session)}
-                          onPin={(event) => void pinSession(event, session)}
-                          onMenu={(event) => placeMenu(event, { kind: "session", id: session.sessionId })}
-                          onStartRename={() => setRenamingId(session.sessionId)}
-                          onRename={(title) => void renameSession(session, title)}
-                          onCancelRename={() => setRenamingId(undefined)}
-                        />
-                      ))
-                    : null}
+                                {child.cwd && (
+                                  <button
+                                    className="btn tiny"
+                                    type="button"
+                                    title="在此目录新建会话"
+                                    onClick={() => void startIn(child.cwd!)}
+                                  >
+                                    +
+                                  </button>
+                                )}
+                              </header>
+                              <Fold collapsed={childCollapsed}>
+                                {child.sessions.map((session) => (
+                                  <SessionRow
+                                    key={session.sessionId}
+                                    session={session}
+                                    active={session.sessionId === state.sessionId}
+                                    busy={state.busy && session.sessionId === state.sessionId}
+                                    menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
+                                    renaming={renamingId === session.sessionId}
+                                    onOpen={() => void openSession(session)}
+                                    onPin={(event) => void pinSession(event, session)}
+                                    onMenu={(event) => placeMenu(event, { kind: "session", id: session.sessionId })}
+                                    onStartRename={() => setRenamingId(session.sessionId)}
+                                    onRename={(title) => void renameSession(session, title)}
+                                    onCancelRename={() => setRenamingId(undefined)}
+                                  />
+                                ))}
+                              </Fold>
+                            </div>
+                          );
+                        })
+                      : group.sessions.map((session) => (
+                          <SessionRow
+                            key={session.sessionId}
+                            session={session}
+                            active={session.sessionId === state.sessionId}
+                            busy={state.busy && session.sessionId === state.sessionId}
+                            menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
+                            renaming={renamingId === session.sessionId}
+                            onOpen={() => void openSession(session)}
+                            onPin={(event) => void pinSession(event, session)}
+                            onMenu={(event) => placeMenu(event, { kind: "session", id: session.sessionId })}
+                            onStartRename={() => setRenamingId(session.sessionId)}
+                            onRename={(title) => void renameSession(session, title)}
+                            onCancelRename={() => setRenamingId(undefined)}
+                          />
+                        ))}
+                  </Fold>
                 </section>
               );
             })}
+            {hiddenWorkspaceGroups.length > 0 && (
+              <section className="session-group hidden-workspaces">
+                <header className="session-group-head">
+                  <button
+                    className="session-group-toggle"
+                    type="button"
+                    onClick={() => void window.grok.toggleGroup("__hidden__").then(setState)}
+                  >
+                    <FoldChevron open={!hiddenCollapsed} />
+                    <span className="session-group-copy">
+                      <strong>已隐藏</strong>
+                    </span>
+                    <span className="session-count">{hiddenWorkspaceGroups.length}</span>
+                  </button>
+                </header>
+                <Fold collapsed={hiddenCollapsed}>
+                  {hiddenWorkspaceGroups.map((group) => (
+                    <div
+                      className={`session-group-head hidden-row ${menu?.kind === "group" && menu.id === group.key ? "menu-open" : ""}`}
+                      key={group.key}
+                    >
+                      <button
+                        className="session-group-toggle"
+                        type="button"
+                        title={group.cwd}
+                        onClick={() => void window.grok.revealWorkspace(group.key).then(setState)}
+                      >
+                        <span className="session-group-copy">
+                          <strong>{group.label}</strong>
+                        </span>
+                        <span className="session-count">{group.sessions.length}</span>
+                      </button>
+                      <button
+                        className="kebab"
+                        type="button"
+                        title="工作区操作"
+                        onClick={(event) => placeMenu(event, { kind: "group", id: group.key })}
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  ))}
+                </Fold>
+              </section>
+            )}
             {archivedSessions.length > 0 && (
               <section className="session-group archived">
                 <header
@@ -1594,21 +1653,22 @@ export function App() {
                   <button
                     className="session-group-toggle"
                     type="button"
-                    onClick={() => void window.grok.toggleGroup("__archived__")}
+                    onClick={() => void window.grok.toggleGroup("__archived__").then(setState)}
                   >
-                    <span className="chevron">{archivedCollapsed ? "▸" : "▾"}</span>
+                    <FoldChevron open={!archivedCollapsed} />
                     <span className="session-group-copy">
                       <strong>已归档</strong>
                     </span>
                     <span className="session-count">{archivedSessions.length}</span>
                   </button>
                 </header>
-                {!archivedCollapsed &&
-                  archivedSessions.map((session) => (
+                <Fold collapsed={archivedCollapsed}>
+                  {archivedSessions.map((session) => (
                     <SessionRow
                       key={session.sessionId}
                       session={session}
                       active={session.sessionId === state.sessionId}
+                      busy={state.busy && session.sessionId === state.sessionId}
                       menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
                       renaming={renamingId === session.sessionId}
                       onOpen={() => void openSession(session)}
@@ -1619,20 +1679,16 @@ export function App() {
                       onCancelRename={() => setRenamingId(undefined)}
                     />
                   ))}
+                </Fold>
               </section>
             )}
           </div>
-          <div
-            className="user-dock"
-            ref={accountDockRef}
-            onBlur={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-                setAccountOpen(false);
-              }
-            }}
-          >
+          <div className="user-dock" ref={accountDockRef}>
             {accountOpen && (
-              <div className="user-pop">
+              <div
+                className="user-pop"
+                onPointerDown={(event) => event.stopPropagation()}
+              >
                 <h3>{account.email ?? "未登录"}</h3>
                 <dl>
                   <dt>状态</dt>
@@ -1655,12 +1711,13 @@ export function App() {
                       </div>
                       <small>
                         已用 {Math.round(used)}%
+                        {quota?.period ? ` · ${quota.period}` : ""}
                         {quota?.resetAt ? ` · 重置 ${new Date(quota.resetAt).toLocaleString()}` : ""}
                         {quota?.extraCredits ? ` · 额外 ${quota.extraCredits}` : ""}
                       </small>
                     </>
                   ) : (
-                    <small>暂未从 grok 账单接口取到额度，显示本地账号信息。</small>
+                    <small>正在从 /usage 同步额度，每 5 分钟更新一次。</small>
                   )}
                 </div>
                 <button
@@ -1690,9 +1747,10 @@ export function App() {
               <button
                 className="user-chip"
                 type="button"
-                onClick={() => {
+                onClick={(event) => {
+                  event.stopPropagation();
                   setAccountOpen((open) => !open);
-                  if (!accountOpen) void window.grok.refreshAccount();
+                  if (!accountOpen) void window.grok.refreshAccount().then(setState);
                 }}
               >
                 <span className="avatar">{initial}</span>
@@ -1704,6 +1762,18 @@ export function App() {
                     {account.plan ? ` · ${account.plan}` : ""}
                   </span>
                 </span>
+              </button>
+              <button
+                className="icon-btn"
+                type="button"
+                title="设置"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setAccountOpen(false);
+                  setSettingsOpen(true);
+                }}
+              >
+                ⚙
               </button>
               {state.update?.updateAvailable ? (
                 <button
@@ -1727,8 +1797,13 @@ export function App() {
         <div className="topbar">
           <div className="topbar-title" title={state.sessionTitle || undefined}>
             <strong>{home ? "新对话" : state.sessionTitle || "未选择对话"}</strong>
+            {state.busy && !home ? (
+              <span className="topbar-spinner" title="执行中">
+                <Spinner />
+              </span>
+            ) : null}
             {(home ? draftWorkspace : state.workspace) ? (
-              <span>{folderLabel((home ? draftWorkspace : state.workspace) ?? "")}</span>
+              <span className="topbar-cwd">{folderLabel((home ? draftWorkspace : state.workspace) ?? "")}</span>
             ) : null}
           </div>
           <div className="topbar-actions">
@@ -1758,7 +1833,7 @@ export function App() {
         {home ? (
           <div className="home">
             <h1>新对话</h1>
-            <p>指定工作区、模型、模式和思维长度，然后直接开聊。</p>
+            <p>指定工作区、模型和思考长度，然后直接开聊。</p>
             <div className="composer home-composer">
               {slashHits.length > 0 && (
                 <SlashMenu commands={slashHits} activeIndex={slashIndex} onPick={completeSlash} />
@@ -1786,43 +1861,13 @@ export function App() {
                     </button>
                   ) : null}
                 </div>
-                <select
-                  className="chip"
-                  value={draftModel}
-                  onChange={(event) => {
-                    const modelId = event.target.value;
-                    setDraftModel(modelId);
-                    const model = state.models.find((item) => item.modelId === modelId);
-                    if (model?.defaultEffort) setDraftEffort(model.defaultEffort);
-                    else if (model?.efforts?.length && !model.efforts.includes(draftEffort)) {
-                      setDraftEffort(model.efforts[model.efforts.length - 1] ?? "high");
-                    }
-                  }}
-                >
-                  {state.models.length === 0 && <option value="">模型</option>}
-                  {state.models.map((model) => (
-                    <option key={model.modelId} value={model.modelId}>
-                      {model.name}
-                    </option>
-                  ))}
-                </select>
-                <PermissionChips
-                  mode={draftMode}
-                  rememberApprovals={state.settings.rememberToolApprovals}
-                  defaultSelected={state.settings.defaultSelectedPermission}
-                  onMode={applyMode}
-                  onRemember={(value) => void window.grok.setGrokSetting("rememberToolApprovals", value).then(setState)}
-                  onDefaultSelected={(value) =>
-                    void window.grok.setGrokSetting("defaultSelectedPermission", value).then(setState)
-                  }
+                <ModelEffortPicker
+                  models={state.models}
+                  modelId={state.modelId}
+                  effort={state.effort}
+                  disabled={state.busy}
+                  onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
                 />
-                <select className="chip" value={draftEffort} onChange={(event) => setDraftEffort(event.target.value)}>
-                  {effortChoices.map((effort) => (
-                    <option key={effort} value={effort}>
-                      {EFFORT_LABEL[effort] ?? effort}
-                    </option>
-                  ))}
-                </select>
                 <ComposerSubmit
                   busy={state.busy}
                   disabled={!draft.trim() && !state.busy}
@@ -1900,15 +1945,12 @@ export function App() {
                   rows={3}
                 />
                 <div className="composer-toolbar">
-                  <PermissionChips
-                    mode={draftMode}
-                    rememberApprovals={state.settings.rememberToolApprovals}
-                    defaultSelected={state.settings.defaultSelectedPermission}
-                    onMode={applyMode}
-                    onRemember={(value) => void window.grok.setGrokSetting("rememberToolApprovals", value).then(setState)}
-                    onDefaultSelected={(value) =>
-                      void window.grok.setGrokSetting("defaultSelectedPermission", value).then(setState)
-                    }
+                  <ModelEffortPicker
+                    models={state.models}
+                    modelId={state.modelId}
+                    effort={state.effort}
+                    disabled={state.busy}
+                    onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
                   />
                   <ComposerSubmit
                     busy={state.busy}
@@ -2036,14 +2078,15 @@ function groupsByCwd(
   const map = new Map<string, SessionSummary[]>();
   for (const session of sessions) {
     const cwd = session.cwd?.trim() || "(unknown)";
-    const list = map.get(cwd) ?? [];
+    const key = keyPrefix ? `${keyPrefix}${normalizeGroupKey(cwd)}` : normalizeGroupKey(cwd);
+    const list = map.get(key) ?? [];
     list.push(session);
-    map.set(cwd, list);
+    map.set(key, list);
   }
-  const rest = [...map.entries()].map(([cwd, rows]) => ({
-    key: keyPrefix ? `${keyPrefix}${cwd}` : cwd,
-    label: folderLabel(cwd),
-    cwd: cwd === "(unknown)" ? undefined : cwd,
+  const rest = [...map.entries()].map(([key, rows]) => ({
+    key,
+    label: folderLabel(rows[0]?.cwd?.trim() || key),
+    cwd: key === "(unknown)" || key.startsWith("__") ? undefined : rows[0]?.cwd?.trim() || key,
     sessions: sortSessions(rows, sort, pinFirst),
   }));
   return sortGroups(rest, groupSort);

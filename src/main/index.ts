@@ -9,8 +9,16 @@ let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let quitting = false;
 
-function iconFile(): string {
-  return join(app.getAppPath(), "resources", "icon.jpg");
+function iconDir(): string {
+  return join(app.getAppPath(), "resources");
+}
+
+function windowIconFile(): string {
+  return join(iconDir(), "icon.png");
+}
+
+function trayIconFile(): string {
+  return join(iconDir(), process.platform === "win32" ? "icon.ico" : "icon.png");
 }
 
 function showWindow(): void {
@@ -34,7 +42,7 @@ function createMenu(): void {
 }
 
 function createTray(): void {
-  const image = nativeImage.createFromPath(iconFile());
+  const image = nativeImage.createFromPath(trayIconFile());
   tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image.resize({ width: 16, height: 16 }));
   tray.setToolTip("Grok-Harness");
   tray.on("click", () => showWindow());
@@ -54,7 +62,7 @@ function createTray(): void {
 }
 
 function createWindow(): void {
-  const icon = nativeImage.createFromPath(iconFile());
+  const icon = nativeImage.createFromPath(windowIconFile());
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
@@ -213,6 +221,34 @@ app.whenReady().then(async () => {
     host.setCollapsedGroups(Array.isArray(keys) ? keys.map(String) : []);
     return host.getSnapshot();
   });
+  ipcMain.handle("grok:hideWorkspace", (_evt, key: string) => {
+    host.hideWorkspace(String(key ?? ""));
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:revealWorkspace", (_evt, key: string) => {
+    host.revealWorkspace(String(key ?? ""));
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:deleteWorkspace", async (_evt, cwd: string) => {
+    const target = String(cwd ?? "").trim();
+    if (!target) return host.getSnapshot();
+    const count = host.getSnapshot().sessions.filter((session) => (session.cwd?.trim() || "(unknown)") === target).length;
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options: Electron.MessageBoxOptions = {
+      type: "warning",
+      buttons: ["删除", "取消"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "删除工作区",
+      message: "删除这个工作区的全部会话？",
+      detail: `将删除 ${count} 个会话，无法恢复。不会删除磁盘上的项目文件夹。`,
+    };
+    const result = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options);
+    if (result.response !== 0) return host.getSnapshot();
+    await host.deleteWorkspace(target);
+    return host.getSnapshot();
+  });
   ipcMain.handle("grok:setSidebarSort", (_evt, groupSort?: unknown, sessionSort?: unknown) => {
     host.setSidebarSort(groupSort as GroupSort | undefined, sessionSort as SessionSort | undefined);
     return host.getSnapshot();
@@ -233,6 +269,10 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("grok:setGrokSetting", (_evt, key: string, value: unknown) => {
     if (isGrokSettingKey(key)) host.setGrokSetting(key, value);
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:setModelEffort", async (_evt, modelId: string, effort?: string) => {
+    await host.setModelEffort(String(modelId ?? ""), effort ? String(effort) : undefined);
     return host.getSnapshot();
   });
   ipcMain.handle("grok:checkUpdate", async () => {
