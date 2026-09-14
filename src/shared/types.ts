@@ -52,8 +52,8 @@ export type SessionRef = {
 
 export type TimelineItem =
   | { id: string; kind: "user"; text: string; at?: number; attachments?: PromptAttachment[]; sessionRefs?: SessionRef[] }
-  | { id: string; kind: "thought"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number }
-  | { id: string; kind: "assistant"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number }
+  | { id: string; kind: "thought"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number; interrupted?: boolean }
+  | { id: string; kind: "assistant"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number; interrupted?: boolean }
   | {
       id: string;
       kind: "tool";
@@ -67,9 +67,12 @@ export type TimelineItem =
       at?: number;
       durationMs?: number;
       tokens?: number;
+      background?: boolean;
+      interrupted?: boolean;
     }
   | { id: string; kind: "plan"; text: string; at?: number; durationMs?: number; tokens?: number }
-  | { id: string; kind: "system"; text: string; tone?: "info" | "error"; at?: number };
+  | { id: string; kind: "system"; text: string; tone?: "info" | "error"; at?: number }
+  | { id: string; kind: "interrupt"; at?: number; durationMs?: number };
 
 export type PermissionOption = {
   optionId: string;
@@ -98,6 +101,10 @@ export type SessionSummary = {
   unread?: boolean;
   archived?: boolean;
   interrupted?: boolean;
+  updateInterrupted?: boolean;
+  /** Live Grok background tasks (commands / monitors / loops / subagents). */
+  running?: boolean;
+  backgroundCount?: number;
 };
 
 export type UpdateRiskSession = {
@@ -184,6 +191,42 @@ export type StartOptions = {
   effort?: string;
 };
 
+export type BackgroundTask = {
+  id: string;
+  title: string;
+  kind: "command" | "monitor" | "subagent" | "loop";
+  status: string;
+  command?: string;
+  startedAt?: number;
+};
+
+export type SessionRunStats = {
+  startedAt?: number;
+  turnStartedAt?: number;
+  durationMs?: number;
+  tokens?: number;
+};
+
+export type TokenDay = {
+  day: string;
+  tokens: number;
+};
+
+export type TokenUsageSummary = {
+  days: TokenDay[];
+  total: number;
+  today: number;
+};
+
+export type QueuedPrompt = {
+  id: string;
+  text: string;
+  attachments: PromptAttachment[];
+  sessionRefs: SessionRef[];
+  mode: "queue" | "steer";
+  combined?: boolean;
+};
+
 export type AppSnapshot = {
   connection: ConnectionState;
   error?: string;
@@ -216,6 +259,10 @@ export type AppSnapshot = {
   commands: SlashCommand[];
   settings: GrokSettings;
   update?: GrokUpdateInfo;
+  backgroundTasks: BackgroundTask[];
+  runStats: SessionRunStats;
+  tokenUsage: TokenUsageSummary;
+  promptQueue: QueuedPrompt[];
 };
 
 export type { SlashCommand } from "./slash";

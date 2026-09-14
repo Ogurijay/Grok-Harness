@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { app } from "electron";
 import initSqlJs, { type Database } from "sql.js";
-import type { SessionSummary } from "../shared/types";
+import type { SessionSummary, TokenDay, TokenUsageSummary } from "../shared/types";
 
 const require = createRequire(import.meta.url);
 
@@ -47,7 +47,56 @@ export class LocalDb {
     this.ensureColumn("session_flags", "archived", "archived INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("session_flags", "title", "title TEXT");
     this.ensureColumn("session_flags", "interrupted", "interrupted INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("session_flags", "update_interrupted", "update_interrupted INTEGER NOT NULL DEFAULT 0");
+    if (this.getKv("interruptMeaning") !== "turn") {
+      this.db.run("UPDATE session_flags SET update_interrupted = interrupted, interrupted = 0 WHERE interrupted = 1");
+      this.setKv("interruptMeaning", "turn");
+    }
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS token_days (
+        day TEXT PRIMARY KEY,
+        tokens INTEGER NOT NULL DEFAULT 0
+      );
+    `);
     this.persist();
+  }
+
+  static dayKey(at = Date.now()): string {
+    const date = new Date(at);
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  addTokens(delta: number, at = Date.now()): void {
+    if (!this.db || !Number.isFinite(delta) || delta <= 0) return;
+    const day = LocalDb.dayKey(at);
+    this.db.run(
+      `INSERT INTO token_days(day, tokens) VALUES (?, ?)
+       ON CONFLICT(day) DO UPDATE SET tokens = tokens + excluded.tokens`,
+      [day, Math.round(delta)],
+    );
+    this.persist();
+  }
+
+  tokenSummary(): TokenUsageSummary {
+    const days: TokenDay[] = [];
+    let total = 0;
+    if (this.db) {
+      const stmt = this.db.prepare("SELECT day, tokens FROM token_days ORDER BY day ASC");
+      while (stmt.step()) {
+        const row = stmt.get();
+        const day = String(row[0] ?? "");
+        const tokens = Number(row[1] ?? 0);
+        if (!day || !Number.isFinite(tokens) || tokens <= 0) continue;
+        days.push({ day, tokens });
+        total += tokens;
+      }
+      stmt.free();
+    }
+    const today = days.find((row) => row.day === LocalDb.dayKey())?.tokens ?? 0;
+    return { days, total, today };
   }
 
   private ensureColumn(table: string, column: string, ddl: string): void {
@@ -112,7 +161,7 @@ export class LocalDb {
     const now = Date.now();
     const merged = sessions.map((session) => {
       const stmt = this.db!.prepare(
-        "SELECT pinned, pin_order, last_read_ms, archived, title, interrupted FROM session_flags WHERE session_id = ?",
+        "SELECT pinned, pin_order, last_read_ms, archived, title, interrupted, update_interrupted FROM session_flags WHERE session_id = ?",
       );
       stmt.bind([session.sessionId]);
       const existing = stmt.step() ? stmt.get() : undefined;
@@ -131,6 +180,7 @@ export class LocalDb {
           archived: false,
           unread: bootstrapped && session.sessionId !== currentId && updatedAtMs > lastRead,
           interrupted: false,
+          updateInterrupted: false,
         };
       }
       const pinned = Number(existing[0]) === 1;
@@ -139,6 +189,7 @@ export class LocalDb {
       const archived = Number(existing[3]) === 1;
       const localTitle = typeof existing[4] === "string" ? existing[4].trim() : "";
       const interrupted = Number(existing[5]) === 1;
+      const updateInterrupted = Number(existing[6]) === 1;
       const unread = session.sessionId !== currentId && updatedAtMs > lastReadMs + 500;
       return {
         ...session,
@@ -148,6 +199,7 @@ export class LocalDb {
         archived,
         unread,
         interrupted,
+        updateInterrupted,
       };
     });
     if (!bootstrapped) this.setKv("bootstrapped", "1");
@@ -219,12 +271,36 @@ export class LocalDb {
     this.persist();
   }
 
+  markUpdateInterrupted(sessionIds: string[]): void {
+    if (!this.db || !sessionIds.length) return;
+    for (const sessionId of sessionIds) {
+      this.db.run(
+        `INSERT INTO session_flags(session_id, pinned, pin_order, last_read_ms, archived, interrupted, update_interrupted)
+         VALUES (?, 0, 0, 0, 0, 0, 1)
+         ON CONFLICT(session_id) DO UPDATE SET update_interrupted = 1`,
+        [sessionId],
+      );
+    }
+    this.persist();
+  }
+
   clearInterrupted(sessionId: string): void {
     if (!this.db) return;
     this.db.run(
       `INSERT INTO session_flags(session_id, pinned, pin_order, last_read_ms, archived, interrupted)
        VALUES (?, 0, 0, 0, 0, 0)
        ON CONFLICT(session_id) DO UPDATE SET interrupted = 0`,
+      [sessionId],
+    );
+    this.persist();
+  }
+
+  clearUpdateInterrupted(sessionId: string): void {
+    if (!this.db) return;
+    this.db.run(
+      `INSERT INTO session_flags(session_id, pinned, pin_order, last_read_ms, archived, interrupted, update_interrupted)
+       VALUES (?, 0, 0, 0, 0, 0, 0)
+       ON CONFLICT(session_id) DO UPDATE SET update_interrupted = 0`,
       [sessionId],
     );
     this.persist();

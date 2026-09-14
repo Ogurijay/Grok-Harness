@@ -43,7 +43,7 @@ Every GitHub iteration **must** bump `package.json` version and add a bilingual 
 
 每次迭代到 GitHub **必须**升版本号并在 `CHANGELOG.md` 新增中英双语说明。规则见 [`AGENTS.md`](./AGENTS.md)。
 
-Current / 当前：**v0.3.0**
+Current / 当前：**v0.4.0**
 
 ## Safety / 安全
 

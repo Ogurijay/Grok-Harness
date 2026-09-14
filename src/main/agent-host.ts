@@ -4,15 +4,19 @@ import { ABSORBED_BY_STREAM, AcpClient } from "../shared/acp-client";
 import type {
   AgentUiEvent,
   AppSnapshot,
+  BackgroundTask,
   JsonValue,
   MentionHit,
   ModelInfo,
   PermissionOption,
   PermissionRequest,
   PromptAttachment,
+  QueuedPrompt,
   GroupSort,
   SessionMode,
   SessionRef,
+  SessionRunStats,
+  SessionSummary,
   SessionSort,
   StartOptions,
   TimelineItem,
@@ -106,18 +110,76 @@ function collectDiffs(content: unknown): ToolDiff[] {
   return diffs;
 }
 
-function collectOutput(content: unknown): string | undefined {
-  if (!Array.isArray(content)) return undefined;
-  const parts: string[] = [];
-  for (const entry of content) {
-    const rec = asRecord(entry);
-    if (!rec) continue;
-    if (asString(rec.type) === "content" || asString(rec.type) === "text") {
-      const text = collectText(rec.content ?? rec);
-      if (text) parts.push(text);
-    }
+function collectHaystack(value: unknown, into: string[]): void {
+  if (typeof value === "string") {
+    if (value.trim()) into.push(value);
+    return;
   }
+  if (Array.isArray(value)) {
+    for (const entry of value) collectHaystack(entry, into);
+    return;
+  }
+  const rec = asRecord(value);
+  if (!rec) return;
+  for (const entry of Object.values(rec)) collectHaystack(entry, into);
+}
+
+function collectOutput(content: unknown): string | undefined {
+  const parts: string[] = [];
+  collectHaystack(content, parts);
   return parts.length ? parts.join("\n") : undefined;
+}
+
+function looksBackground(text?: string): boolean {
+  if (!text) return false;
+  return /moved to (the )?background|still running|<status>\s*running\s*<\/status>|status:\s*running|automatically moved to background|background:\s*true/i.test(
+    text,
+  );
+}
+
+function taskKindFrom(raw?: string, title?: string): BackgroundTask["kind"] {
+  const hay = `${raw ?? ""} ${title ?? ""}`.toLowerCase();
+  if (/monitor/.test(hay)) return "monitor";
+  if (/subagent|spawn/.test(hay)) return "subagent";
+  if (/loop|scheduler/.test(hay)) return "loop";
+  return "command";
+}
+
+function parseBackgroundTask(raw: unknown): BackgroundTask | undefined {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const snap = asRecord(rec.task_snapshot) ?? rec;
+  const id =
+    asString(snap.task_id) ??
+    asString(snap.taskId) ??
+    asString(snap.id) ??
+    asString(rec.task_id) ??
+    asString(rec.taskId) ??
+    asString(rec.tool_call_id) ??
+    asString(rec.toolCallId);
+  if (!id) return undefined;
+  const command = asString(snap.command) ?? asString(rec.command);
+  const title =
+    asString(snap.description) ??
+    asString(rec.description) ??
+    asString(snap.title) ??
+    asString(rec.title) ??
+    command ??
+    "task";
+  const kindRaw = asString(snap.kind) ?? asString(rec.kind);
+  const start = asRecord(snap.start_time) ?? asRecord(rec.start_time);
+  const startedAt =
+    typeof start?.secs_since_epoch === "number"
+      ? start.secs_since_epoch * 1000 + Math.floor((Number(start.nanos_since_epoch) || 0) / 1e6)
+      : Date.now();
+  return {
+    id,
+    title,
+    kind: taskKindFrom(kindRaw, title),
+    status: "running",
+    command,
+    startedAt,
+  };
 }
 
 export class AgentHost {
@@ -127,8 +189,12 @@ export class AgentHost {
   private db = new LocalDb();
   private listeners = new Set<(event: AgentUiEvent) => void>();
   private hydrating = false;
+  private drainingQueue = false;
+  private promptEpoch = 0;
+  private ignoreUpdates = false;
   private accountRefreshing = false;
   private statsCursor: StatsCursor = {};
+  private sessionTasks = new Map<string, Map<string, BackgroundTask>>();
   private permissionWaiters = new Map<
     string,
     { resolve: (optionId: string | null) => void }
@@ -153,6 +219,10 @@ export class AgentHost {
     account: { connection: "idle" },
     commands: mergeSlashCommands(),
     settings: GROK_SETTINGS_DEFAULTS,
+    backgroundTasks: [],
+    runStats: {},
+    tokenUsage: { days: [], total: 0, today: 0 },
+    promptQueue: [],
   };
 
   onEvent(listener: (event: AgentUiEvent) => void): () => void {
@@ -178,6 +248,7 @@ export class AgentHost {
       grokBinary: this.snapshot.grokBinary ?? this.snapshot.account.grokBinary,
       connection: this.snapshot.connection,
     };
+    this.syncDerived();
     this.emit({ type: "snapshot", snapshot: this.snapshot });
   }
 
@@ -335,7 +406,7 @@ export class AgentHost {
     const resumeCwd = this.snapshot.workspace;
     const interruptIds = new Set(atRisk.map((row) => row.sessionId));
     if (resumeId) interruptIds.add(resumeId);
-    this.db.markInterrupted([...interruptIds]);
+    this.db.markUpdateInterrupted([...interruptIds]);
     try {
       if (this.snapshot.busy) {
         try {
@@ -387,7 +458,7 @@ export class AgentHost {
   }
 
   async dismissInterrupted(sessionId: string): Promise<void> {
-    this.db.clearInterrupted(sessionId);
+    this.db.clearUpdateInterrupted(sessionId);
     await this.loadLocalSessions();
   }
 
@@ -409,6 +480,7 @@ export class AgentHost {
 
   private pushItem(item: TimelineItem): void {
     this.snapshot = { ...this.snapshot, timeline: [...this.snapshot.timeline, item] };
+    this.syncDerived();
     this.emit({ type: "timeline", item });
     this.emit({ type: "snapshot", snapshot: this.snapshot });
   }
@@ -420,8 +492,143 @@ export class AgentHost {
         item.id === id ? ({ ...item, ...patch } as TimelineItem) : item,
       ),
     };
+    this.syncDerived();
     this.emit({ type: "timeline-patch", id, patch });
     this.emit({ type: "snapshot", snapshot: this.snapshot });
+  }
+
+  private noteTokens(before?: number): void {
+    if (this.hydrating) return;
+    const after = this.statsCursor.lastTokens;
+    if (before == null || after == null || after <= before) return;
+    this.db.addTokens(after - before);
+  }
+
+  private computeRunStats(): SessionRunStats {
+    let tokens = 0;
+    let startedAt: number | undefined;
+    let lastAt: number | undefined;
+    for (const item of this.snapshot.timeline) {
+      if ("tokens" in item && item.tokens) tokens += item.tokens;
+      if (item.at != null) {
+        startedAt = startedAt == null ? item.at : Math.min(startedAt, item.at);
+        const end = item.at + ("durationMs" in item && item.durationMs ? item.durationMs : 0);
+        lastAt = lastAt == null ? end : Math.max(lastAt, end);
+      }
+    }
+    const turnStartedAt = this.snapshot.busy ? this.snapshot.runStats.turnStartedAt : undefined;
+    const endAt = this.snapshot.busy ? Date.now() : lastAt;
+    const durationMs = startedAt != null && endAt != null ? Math.max(0, endAt - startedAt) : undefined;
+    return { startedAt, turnStartedAt, durationMs, tokens: tokens || undefined };
+  }
+
+  private tasksFor(sessionId?: string): BackgroundTask[] {
+    if (!sessionId) return [];
+    return [...(this.sessionTasks.get(sessionId)?.values() ?? [])];
+  }
+
+  private bagFor(sessionId: string): Map<string, BackgroundTask> {
+    let bag = this.sessionTasks.get(sessionId);
+    if (!bag) {
+      bag = new Map();
+      this.sessionTasks.set(sessionId, bag);
+    }
+    return bag;
+  }
+
+  private clearLiveTasks(): void {
+    this.sessionTasks.clear();
+  }
+
+  private applyBackgroundTaskUpdate(
+    kind: string,
+    update: Record<string, unknown>,
+    sessionId?: string,
+  ): void {
+    const snap = asRecord(update.task_snapshot);
+    const owner =
+      asString(snap?.owner_session_id) ??
+      asString(update.owner_session_id) ??
+      sessionId ??
+      this.snapshot.sessionId;
+    if (!owner) return;
+
+    if (kind === "task_backgrounded") {
+      const task = parseBackgroundTask(update);
+      if (!task) return;
+      const prev = this.bagFor(owner).get(task.id);
+      this.bagFor(owner).set(task.id, {
+        ...task,
+        startedAt: prev?.startedAt ?? task.startedAt,
+      });
+      const toolCallId = asString(update.tool_call_id) ?? asString(update.toolCallId) ?? task.id;
+      const existing = this.snapshot.timeline.find(
+        (item): item is Extract<TimelineItem, { kind: "tool" }> =>
+          item.kind === "tool" && (item.toolCallId === toolCallId || item.toolCallId === task.id),
+      );
+      if (existing && !existing.background) {
+        this.patchItem(existing.id, { background: true });
+        return;
+      }
+      this.patch({});
+      return;
+    }
+
+    if (kind === "task_completed") {
+      const task = parseBackgroundTask(update);
+      const id = task?.id ?? asString(update.task_id) ?? asString(update.taskId);
+      if (!id) return;
+      const bag = this.sessionTasks.get(owner);
+      bag?.delete(id);
+      if (bag && bag.size === 0) this.sessionTasks.delete(owner);
+      this.patch({});
+      return;
+    }
+
+    if (kind === "background_tasks") {
+      const rows = Array.isArray(update.tasks) ? update.tasks : [];
+      if (!rows.length) return;
+      const bag = new Map<string, BackgroundTask>();
+      for (const row of rows) {
+        const task = parseBackgroundTask(row);
+        if (task) bag.set(task.id, task);
+      }
+      if (bag.size) this.sessionTasks.set(owner, bag);
+      else this.sessionTasks.delete(owner);
+      this.patch({});
+    }
+  }
+
+  private listBackgroundTasks(): BackgroundTask[] {
+    return this.tasksFor(this.snapshot.sessionId);
+  }
+
+  private decorateSessions(sessions: SessionSummary[]): SessionSummary[] {
+    const currentId = this.snapshot.sessionId;
+    const currentTasks = this.listBackgroundTasks();
+    return sessions.map((session) => {
+      const tasks = session.sessionId === currentId ? currentTasks : this.tasksFor(session.sessionId);
+      return {
+        ...session,
+        running: tasks.length > 0,
+        backgroundCount: tasks.length,
+      };
+    });
+  }
+
+  private syncDerived(): void {
+    const hadBackground = this.snapshot.backgroundTasks.length > 0;
+    const backgroundTasks = this.listBackgroundTasks();
+    this.snapshot = {
+      ...this.snapshot,
+      runStats: this.computeRunStats(),
+      backgroundTasks,
+      sessions: this.decorateSessions(this.snapshot.sessions),
+      tokenUsage: this.db.tokenSummary(),
+    };
+    if (hadBackground && !backgroundTasks.length && !this.snapshot.busy && this.snapshot.promptQueue.length) {
+      void this.drainQueue();
+    }
   }
 
   private fail(message: string): void {
@@ -565,6 +772,7 @@ export class AgentHost {
       timeline: [],
       permission: undefined,
       busy: false,
+      promptQueue: [],
       error: undefined,
       workspace: nextWorkspace,
       sessionMode: (this.db.getKv("lastMode") as SessionMode | undefined) ?? this.snapshot.sessionMode,
@@ -766,12 +974,14 @@ export class AgentHost {
       return this.client;
     }
 
+    this.clearLiveTasks();
     this.patch({
       connection: "starting",
       error: undefined,
       alwaysApprove,
       busy: false,
       permission: undefined,
+      backgroundTasks: [],
     });
 
     const binary = resolveGrokBinary();
@@ -794,7 +1004,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.3.0" },
+        clientInfo: { name: "grok-harness", version: "0.4.0" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
@@ -938,6 +1148,7 @@ export class AgentHost {
     this.client = undefined;
     await stopGrokServe(this.serve?.child);
     this.serve = undefined;
+    this.clearLiveTasks();
     if (this.snapshot.connection !== "error") {
       this.patch({
         connection: "stopped",
@@ -980,7 +1191,128 @@ export class AgentHost {
     return hits;
   }
 
-  async sendPrompt(text: string, attachments: PromptAttachment[] = [], sessionRefs: SessionRef[] = []): Promise<void> {
+  private mergeQueued(base: QueuedPrompt, extra: QueuedPrompt): QueuedPrompt {
+    const seen = new Set(base.attachments.map((item) => item.path));
+    const attachments = [...base.attachments];
+    for (const item of extra.attachments) {
+      if (seen.has(item.path)) continue;
+      seen.add(item.path);
+      attachments.push(item);
+    }
+    const refs = [...base.sessionRefs];
+    for (const ref of extra.sessionRefs) {
+      if (refs.some((item) => item.sessionId === ref.sessionId)) continue;
+      refs.push(ref);
+    }
+    return {
+      ...base,
+      text: [base.text, extra.text].map((part) => part.trim()).filter(Boolean).join("\n\n"),
+      attachments,
+      sessionRefs: refs,
+      combined: true,
+    };
+  }
+
+  enqueueFollowUp(text: string, attachments: PromptAttachment[] = [], sessionRefs: SessionRef[] = []): void {
+    const item: QueuedPrompt = {
+      id: randomUUID(),
+      text: text.trim(),
+      attachments,
+      sessionRefs,
+      mode: this.snapshot.settings.followUpBehavior === "steer" ? "steer" : "queue",
+    };
+    if (!item.text && !item.attachments.length && !item.sessionRefs.length) return;
+    let queue = [...this.snapshot.promptQueue];
+    const last = queue[queue.length - 1];
+    if (this.snapshot.settings.combineQueuedPrompts && last) {
+      queue[queue.length - 1] = this.mergeQueued(last, item);
+    } else {
+      queue.push(item);
+    }
+    this.patch({ promptQueue: queue });
+    if (this.snapshot.settings.followUpBehavior === "steer") {
+      const latest = queue[queue.length - 1];
+      if (latest) void this.injectSteer(latest);
+    }
+  }
+
+  removeQueued(id: string): void {
+    this.patch({ promptQueue: this.snapshot.promptQueue.filter((item) => item.id !== id) });
+  }
+
+  async sendQueuedNow(id?: string): Promise<void> {
+    const queue = this.snapshot.promptQueue;
+    const item = id ? queue.find((row) => row.id === id) : queue[0];
+    if (!item) return;
+    this.patch({ promptQueue: queue.filter((row) => row.id !== item.id) });
+    if (this.snapshot.busy) {
+      try {
+        await this.cancel();
+      } catch {
+        /* send anyway */
+      }
+    }
+    await this.sendPrompt(item.text, item.attachments, item.sessionRefs, { now: true });
+  }
+
+  private async injectSteer(item: QueuedPrompt): Promise<void> {
+    const client = this.client;
+    const sessionId = this.snapshot.sessionId;
+    if (!client?.connected || !sessionId) return;
+    const { blocks } = await buildPromptBlocks({
+      text: item.text,
+      attachments: item.attachments,
+      sessionNotes: [],
+    });
+    if (!blocks.length) return;
+    const payloads: Array<{ method: string; params: JsonValue }> = [
+      { method: "_session/steering", params: { sessionId, prompt: blocks as unknown as JsonValue } },
+      { method: "x.ai/session/steer", params: { sessionId, prompt: blocks as unknown as JsonValue } },
+    ];
+    for (const payload of payloads) {
+      try {
+        await client.request(payload.method, payload.params, 8_000);
+        this.patch({ promptQueue: this.snapshot.promptQueue.filter((row) => row.id !== item.id) });
+        return;
+      } catch {
+        /* try next */
+      }
+    }
+  }
+
+  private async drainQueue(): Promise<void> {
+    if (this.drainingQueue) return;
+    this.drainingQueue = true;
+    try {
+      while (!this.snapshot.busy && !this.snapshot.backgroundTasks.length && this.snapshot.promptQueue.length) {
+        const queue = this.snapshot.promptQueue;
+        if (this.snapshot.settings.combineQueuedPrompts && queue.length > 1) {
+          const merged = queue.reduce((acc, item) => this.mergeQueued(acc, item));
+          this.patch({ promptQueue: [] });
+          await this.sendPrompt(merged.text, merged.attachments, merged.sessionRefs, { now: true });
+          continue;
+        }
+        const next = queue[0];
+        this.patch({ promptQueue: queue.slice(1) });
+        await this.sendPrompt(next.text, next.attachments, next.sessionRefs, { now: true });
+      }
+    } finally {
+      this.drainingQueue = false;
+    }
+  }
+
+  async sendPrompt(
+    text: string,
+    attachments: PromptAttachment[] = [],
+    sessionRefs: SessionRef[] = [],
+    opts: { now?: boolean } = {},
+  ): Promise<void> {
+    if (this.snapshot.busy && !opts.now) {
+      this.enqueueFollowUp(text, attachments, sessionRefs);
+      return;
+    }
+    const epoch = ++this.promptEpoch;
+    this.ignoreUpdates = false;
     const client = this.client;
     const sessionId = this.snapshot.sessionId;
     if (!client || !sessionId) throw new Error("还没有就绪的会话");
@@ -1015,11 +1347,14 @@ export class AgentHost {
       kind: "user",
       text: trimmed,
       at: Date.now(),
-      attachments: files.map(({ preview: _preview, ...rest }) => rest),
+      attachments: files,
       sessionRefs: sessionRefs.slice(0, 5),
     });
-    if (sessionId) this.db.markRead(sessionId, Date.now());
-    this.patch({ busy: true });
+    if (sessionId) {
+      this.db.markRead(sessionId, Date.now());
+      this.db.clearInterrupted(sessionId);
+    }
+    this.patch({ busy: true, runStats: { ...this.snapshot.runStats, turnStartedAt: Date.now() } });
     try {
       const sendBlocks = async (prompt: typeof blocks) =>
         client.request("session/prompt", { sessionId, prompt }, 15 * 60_000);
@@ -1030,10 +1365,12 @@ export class AgentHost {
         if (!hasImages) throw err;
         result = await sendBlocks(blocks.filter((block) => block.type !== "image"));
       }
+      if (epoch !== this.promptEpoch) return;
       if (result !== ABSORBED_BY_STREAM) {
         this.finishStreaming();
       }
     } catch (err) {
+      if (epoch !== this.promptEpoch) return;
       this.pushItem({
         id: randomUUID(),
         kind: "system",
@@ -1043,8 +1380,10 @@ export class AgentHost {
       this.finishStreaming();
       throw err;
     } finally {
+      if (epoch !== this.promptEpoch) return;
       this.patch({ busy: false });
       this.desktopNotify("turn_complete", "本轮已完成");
+      if (!this.drainingQueue) void this.drainQueue();
     }
   }
 
@@ -1065,11 +1404,47 @@ export class AgentHost {
   }
 
   async cancel(): Promise<void> {
+    const wasBusy = this.snapshot.busy;
+    this.promptEpoch += 1;
+    this.ignoreUpdates = true;
+    if (wasBusy) {
+      const started = this.snapshot.runStats.turnStartedAt;
+      this.snapshot = {
+        ...this.snapshot,
+        timeline: this.snapshot.timeline.map((item) => {
+          if ((item.kind === "thought" || item.kind === "assistant") && item.streaming) {
+            return { ...item, streaming: false, interrupted: true };
+          }
+          if (
+            item.kind === "tool" &&
+            !item.background &&
+            (item.status === "pending" || item.status === "in_progress")
+          ) {
+            return { ...item, status: "cancelled", interrupted: true };
+          }
+          return item;
+        }),
+      };
+      this.pushItem({
+        id: randomUUID(),
+        kind: "interrupt",
+        at: Date.now(),
+        durationMs: started != null ? Math.max(0, Date.now() - started) : undefined,
+      });
+      if (this.snapshot.sessionId) {
+        this.db.markInterrupted([this.snapshot.sessionId]);
+        await this.loadLocalSessions();
+      }
+    }
+    this.patch({ busy: false, permission: undefined });
     const client = this.client;
     const sessionId = this.snapshot.sessionId;
-    if (!client || !sessionId) return;
-    await client.request("session/cancel", { sessionId }, 15_000);
-    this.patch({ busy: false });
+    if (!client?.connected || !sessionId) return;
+    try {
+      await client.request("session/cancel", { sessionId }, 8_000);
+    } catch {
+      /* agent 可能已经停了 */
+    }
   }
 
   resolvePermission(requestId: string, optionId: string | null): void {
@@ -1100,6 +1475,7 @@ export class AgentHost {
       timeline,
       permission: undefined,
       busy: false,
+      promptQueue: [],
       error: undefined,
       sessions: this.snapshot.sessions.map((row) =>
         row.sessionId === sessionId ? { ...row, unread: false } : row,
@@ -1153,24 +1529,54 @@ export class AgentHost {
       ),
       busy: false,
     };
+    this.syncDerived();
     this.emit({ type: "snapshot", snapshot: this.snapshot });
   }
 
+  private touch(item: { at?: number; durationMs?: number; tokens?: number }, at?: number, totalTokens?: number): void {
+    const before = this.statsCursor.lastTokens;
+    touchStats(item, at, totalTokens, this.statsCursor);
+    this.noteTokens(before);
+  }
+
   private onNotification(method: string, params: JsonValue | undefined): void {
-    if (method === "session/update") {
+    if (
+      method === "session/update" ||
+      method === "_x.ai/session/update" ||
+      method === "x.ai/session/update"
+    ) {
       const rec = asRecord(params) ?? {};
       const update = asRecord(rec.update) ?? rec;
-      this.applySessionUpdate(update, asRecord(rec._meta));
+      this.applySessionUpdate(update, asRecord(rec._meta), asString(rec.sessionId));
       return;
     }
-    if (method.startsWith("x.ai/")) {
+    if (method.startsWith("x.ai/") || method.startsWith("_x.ai/")) {
       return;
     }
   }
 
-  private applySessionUpdate(update: Record<string, unknown>, envelopeMeta?: Record<string, unknown>): void {
+  private applySessionUpdate(
+    update: Record<string, unknown>,
+    envelopeMeta?: Record<string, unknown>,
+    sessionId?: string,
+  ): void {
     const kind = asString(update.sessionUpdate);
+    if (kind === "task_backgrounded" || kind === "task_completed" || kind === "background_tasks") {
+      if (!this.hydrating) this.applyBackgroundTaskUpdate(kind, update, sessionId);
+      return;
+    }
     const stats = readEventStats(update, envelopeMeta, Date.now());
+    if (this.ignoreUpdates && !this.hydrating) {
+      if (kind === "available_commands" || kind === "available_commands_update") {
+        this.patch({
+          commands: mergeSlashCommands(
+            this.snapshot.commands,
+            parseSlashCommands(update.availableCommands ?? update.commands ?? update),
+          ),
+        });
+      }
+      return;
+    }
     if (this.hydrating) {
       if (kind === "available_commands" || kind === "available_commands_update") {
         this.patch({
@@ -1216,7 +1622,7 @@ export class AgentHost {
       const diffs = collectDiffs(update.content);
       const outputText = collectOutput(update.content);
       if (existing) {
-        touchStats(existing, stats.at, stats.totalTokens, this.statsCursor);
+        this.touch(existing, stats.at, stats.totalTokens);
         this.patchItem(existing.id, {
           title: asString(update.title) ?? existing.title,
           status: asString(update.status) ?? existing.status,
@@ -1227,6 +1633,10 @@ export class AgentHost {
           durationMs: existing.durationMs,
           tokens: existing.tokens,
           at: existing.at,
+          background:
+            existing.background ||
+            looksBackground(outputText) ||
+            looksBackground(asString(update.title) ?? existing.title),
         });
       } else {
         const item = {
@@ -1241,8 +1651,11 @@ export class AgentHost {
           outputText,
           at: stats.at ?? Date.now(),
         };
-        touchStats(item, stats.at, stats.totalTokens, this.statsCursor);
-        this.pushItem(item);
+        this.touch(item, stats.at, stats.totalTokens);
+        this.pushItem({
+          ...item,
+          background: looksBackground(outputText) || looksBackground(item.title),
+        });
       }
       return;
     }
@@ -1255,7 +1668,7 @@ export class AgentHost {
       if (!existing || existing.kind !== "tool") return;
       const diffs = collectDiffs(update.content);
       const outputText = collectOutput(update.content);
-      touchStats(existing, stats.at, stats.totalTokens, this.statsCursor);
+      this.touch(existing, stats.at, stats.totalTokens);
       this.patchItem(existing.id, {
         status: asString(update.status) ?? existing.status,
         title: asString(update.title) ?? existing.title,
@@ -1265,6 +1678,10 @@ export class AgentHost {
         durationMs: existing.durationMs,
         tokens: existing.tokens,
         at: existing.at,
+        background:
+          existing.background ||
+          looksBackground(outputText) ||
+          looksBackground(asString(update.title) ?? existing.title),
       });
       return;
     }
@@ -1297,7 +1714,7 @@ export class AgentHost {
     if (!text) return;
     const last = [...this.snapshot.timeline].reverse().find((item) => item.kind === kind && item.streaming);
     if (last && last.kind === kind) {
-      touchStats(last, at, totalTokens, this.statsCursor);
+      this.touch(last, at, totalTokens);
       this.patchItem(last.id, {
         text: last.text + text,
         streaming: true,
@@ -1316,7 +1733,7 @@ export class AgentHost {
       ),
     };
     const item = { id: randomUUID(), kind, text, streaming: true, at: at ?? Date.now() };
-    touchStats(item, at, totalTokens, this.statsCursor);
+    this.touch(item, at, totalTokens);
     this.pushItem(item);
   }
 

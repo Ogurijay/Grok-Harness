@@ -6,6 +6,32 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.4.0 — 2026-09-14
+
+### 中文
+
+- 对话里的图片显示缩略图，可点开大图，可右键复制。
+- 进行中显示本轮计时；结束后在底部给出会话耗时和 token。超过 24 小时显示为 `1d…`。
+- 新增 token 用量页，按天热力图查看消耗。
+- 追问跟随 Grok Build 原生设置：排队或注入，以及是否合并排队追问。
+- 停止会真正取消本轮；强制打断在对话里标「已中断」，与更新打断分开。
+- 后台任务接 ACP：顶部 `Tasks` 列表，输入框上方 `◎ N command still running`；有 task 时对话保持 running。
+- 思考与操作按 Grok TUI 扁平行：`Thought for`、`Edit +n/-n`、搜索、Run 竖条；思考不再折进操作组。
+- 输入框 Enter 发送，Ctrl+Enter 换行。
+
+### English
+
+- Images in the transcript show thumbnails, open full-size, and copy from the context menu.
+- Live turn clock while generating; session duration and tokens at the end. Past 24 hours shows as `1d…`.
+- Token usage page with a per-day heatmap.
+- Follow-ups follow native Grok Build settings (queue vs steer, combine queued prompts).
+- Stop actually cancels the turn; a forced interrupt is marked in the transcript and is distinct from an update interrupt.
+- Background tasks from ACP: a Tasks list at the top, `◎ N command still running` above the composer; a session stays running while tasks are live.
+- Thinking and tools render as Grok TUI rows (`Thought for`, `Edit +n/-n`, search, Run bar); thoughts are not folded into the tool group.
+- Enter sends; Ctrl+Enter inserts a newline.
+
+---
+
 ## 0.3.0 — 2026-09-14
 
 ### 中文

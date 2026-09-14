@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type {
   AppSnapshot,
+  BackgroundTask,
   GroupSort,
   MentionHit,
   PermissionRequest,
@@ -14,14 +15,16 @@ import type {
   SessionSummary,
   SlashCommand,
   TimelineItem,
+  ToolDiff,
 } from "../shared/types";
 import { normalizeGroupKey } from "../shared/types";
 import { CodeView, prettyUnknown } from "./CodeView";
-import { aggregateStats, formatStepStats } from "../shared/step-stats";
+import { formatDuration, formatElapsedClock, formatTokens } from "../shared/step-stats";
 import { GROK_SETTINGS_DEFAULTS } from "../shared/grok-settings";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 import { SettingsPanel } from "./SettingsPanel";
 import { UpdatePanel } from "./UpdatePanel";
+import { UsagePanel } from "./UsagePanel";
 
 const empty: AppSnapshot = {
   connection: "idle",
@@ -43,6 +46,10 @@ const empty: AppSnapshot = {
   account: { connection: "idle" },
   commands: [],
   settings: GROK_SETTINGS_DEFAULTS,
+  backgroundTasks: [],
+  runStats: {},
+  tokenUsage: { days: [], total: 0, today: 0 },
+  promptQueue: [],
 };
 
 const GROUP_SORT_OPTIONS: { id: GroupSort; label: string }[] = [
@@ -313,22 +320,100 @@ function ComposerChips({
   );
 }
 
+function ChatImage({
+  path,
+  preview,
+  name,
+  onOpen,
+}: {
+  path: string;
+  preview?: string;
+  name?: string;
+  onOpen: (path: string, preview?: string, name?: string) => void;
+}) {
+  const remote = /^https?:/i.test(path);
+  return (
+    <button
+      type="button"
+      className="chat-image"
+      title={name || path}
+      onClick={() => onOpen(path, preview, name)}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!remote) void window.grok.imageMenu(path);
+      }}
+    >
+      {preview ? <img src={preview} alt={name || ""} /> : <span className="attach-name">{name || path}</span>}
+    </button>
+  );
+}
+
+function ChatMarkdown({
+  text,
+  onOpenImage,
+}: {
+  text: string;
+  onOpenImage: (path: string, preview?: string, name?: string) => void;
+}) {
+  return (
+    <Markdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={{
+        img({ src, alt }) {
+          if (!src) return null;
+          if (/^https?:/i.test(src) || src.startsWith("data:")) {
+            return (
+              <button
+                type="button"
+                className="chat-image"
+                onClick={() => onOpenImage(src, src, alt)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  if (src.startsWith("data:")) void window.grok.imageMenu(src);
+                }}
+              >
+                <img src={src} alt={alt || ""} />
+              </button>
+            );
+          }
+          return <ChatImage path={src} name={alt} onOpen={onOpenImage} />;
+        },
+      }}
+    >
+      {text}
+    </Markdown>
+  );
+}
+
 function MessageExtras({
   attachments,
   sessionRefs,
+  onOpenImage,
 }: {
   attachments?: PromptAttachment[];
   sessionRefs?: SessionRef[];
+  onOpenImage: (path: string, preview?: string, name?: string) => void;
 }) {
   if (!attachments?.length && !sessionRefs?.length) return null;
   return (
     <div className="message-extras">
-      {attachments?.map((item) => (
-        <div className={`attach-chip static ${item.kind}`} key={item.path} title={item.path}>
-          {item.kind === "image" && item.preview ? <img src={item.preview} alt="" /> : null}
-          <span className="attach-name">{item.name}</span>
-        </div>
-      ))}
+      {attachments?.map((item) =>
+        item.kind === "image" ? (
+          <ChatImage
+            key={item.path}
+            path={item.path}
+            preview={item.preview}
+            name={item.name}
+            onOpen={onOpenImage}
+          />
+        ) : (
+          <div className={`attach-chip static ${item.kind}`} key={item.path} title={item.path}>
+            <span className="attach-name">{item.name}</span>
+          </div>
+        ),
+      )}
       {sessionRefs?.map((item) => (
         <div className="attach-chip static session" key={item.sessionId}>
           <span className="attach-kind">对话</span>
@@ -337,6 +422,125 @@ function MessageExtras({
       ))}
     </div>
   );
+}
+
+function PromptQueueBar({
+  queue,
+  followUp,
+  holding,
+  combine,
+  onSendNow,
+  onRemove,
+}: {
+  queue: AppSnapshot["promptQueue"];
+  followUp: "queue" | "steer";
+  holding: boolean;
+  combine: boolean;
+  onSendNow: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  if (!queue.length) return null;
+  const hint = holding
+    ? "后台任务结束后发送 · 空回车立即发送"
+    : followUp === "steer"
+      ? "将在下一空隙注入"
+      : "本轮结束后发送";
+  return (
+    <div className="prompt-queue">
+      <div className="prompt-queue-head">
+        <span>
+          追问 {queue.length}
+          {combine ? " · 合并" : ""}
+        </span>
+        <em>{hint}</em>
+      </div>
+      {queue.map((item) => (
+        <div className="prompt-queue-row" key={item.id}>
+          <span className="prompt-queue-text">{item.text || (item.attachments.length ? "附件" : "追问")}</span>
+          <button type="button" className="text-action" onClick={() => onSendNow(item.id)}>
+            立即发送
+          </button>
+          <button type="button" className="text-action" onClick={() => onRemove(item.id)}>
+            移除
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function formatBackgroundLine(tasks: BackgroundTask[]): string {
+  const counts = { command: 0, monitor: 0, subagent: 0, loop: 0 };
+  for (const task of tasks) counts[task.kind] += 1;
+  const parts: string[] = [];
+  if (counts.command) parts.push(`${counts.command} command${counts.command === 1 ? "" : "s"}`);
+  if (counts.monitor) parts.push(`${counts.monitor} monitor${counts.monitor === 1 ? "" : "s"}`);
+  if (counts.loop) parts.push(`${counts.loop} loop${counts.loop === 1 ? "" : "s"}`);
+  if (counts.subagent) parts.push(`${counts.subagent} subagent${counts.subagent === 1 ? "" : "s"}`);
+  return `◎ ${parts.join(" · ") || `${tasks.length} task${tasks.length === 1 ? "" : "s"}`} still running`;
+}
+
+function formatTaskAge(ms?: number): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "";
+  const total = Math.floor(ms / 1000);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours}h${minutes}m`;
+  if (minutes > 0) return `${minutes}m${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatSessionRunning(session: SessionSummary): string | undefined {
+  const n = session.backgroundCount ?? 0;
+  if (!session.running || n <= 0) return undefined;
+  return `◎ ${n} task${n === 1 ? "" : "s"} still running`;
+}
+
+function sessionLive(session: SessionSummary, state: AppSnapshot): boolean {
+  return Boolean(session.running) || (state.busy && session.sessionId === state.sessionId);
+}
+
+function TasksPane({ tasks, now }: { tasks: BackgroundTask[]; now: number }) {
+  if (!tasks.length) return null;
+  return (
+    <details className="tasks-pane" open>
+      <summary>
+        <FoldChevron />
+        <span>Tasks {tasks.length}</span>
+      </summary>
+      <ul className="tasks-pane-list">
+        {tasks.map((task) => (
+          <li key={task.id} title={task.command || task.id}>
+            <span className="tasks-bullet">·</span>
+            <span className="tasks-label">Task {task.title}</span>
+            {task.startedAt ? (
+              <span className="tasks-age">{formatTaskAge(now - task.startedAt)}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function StillRunningLine({ tasks }: { tasks: BackgroundTask[] }) {
+  if (!tasks.length) return null;
+  return (
+    <div className="still-running" title={tasks.map((task) => task.command || task.title).join("\n")}>
+      {formatBackgroundLine(tasks)}
+    </div>
+  );
+}
+
+function useNow(active: boolean, interval = 500): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => setNow(Date.now()), interval);
+    return () => window.clearInterval(id);
+  }, [active, interval]);
+  return active ? now : Date.now();
 }
 
 function SlashMenu({
@@ -404,25 +608,6 @@ function ComposerSubmit({
   );
 }
 
-function ToolCard({
-  item,
-  active,
-  onSelect,
-}: {
-  item: Extract<TimelineItem, { kind: "tool" }>;
-  active: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <article className="tool" onClick={onSelect} data-active={active}>
-      <header>
-        <h3>{toolTitlePending(item) ? <StreamingDots /> : item.title}</h3>
-        <span className={`pill ${item.status}`}>{item.status}</span>
-      </header>
-    </article>
-  );
-}
-
 function Stamp({ at, show = true }: { at?: number; show?: boolean }) {
   if (!show || !at) return null;
   return <time className="stamp">{formatClock(at)}</time>;
@@ -449,26 +634,6 @@ function StreamPlaceholder({ label }: { label: string }) {
   );
 }
 
-function LiveDetails({
-  live,
-  className,
-  children,
-}: {
-  live?: boolean;
-  className?: string;
-  children: ReactNode;
-}) {
-  const ref = useRef<HTMLDetailsElement>(null);
-  useLayoutEffect(() => {
-    if (live && ref.current) ref.current.open = true;
-  }, [live]);
-  return (
-    <details ref={ref} className={`${className ?? ""}${live ? " stream-live" : ""}`.trim()}>
-      {children}
-    </details>
-  );
-}
-
 function isBlank(text?: string) {
   return !text || !text.trim();
 }
@@ -480,7 +645,7 @@ function toolTitlePending(item: Extract<TimelineItem, { kind: "tool" }>) {
   return !title || title === "tool";
 }
 
-function isWorkItem(item: TimelineItem): boolean {
+function isActivityItem(item: TimelineItem): boolean {
   return item.kind === "thought" || item.kind === "tool" || item.kind === "plan";
 }
 
@@ -491,41 +656,7 @@ function isLiveItem(item: TimelineItem): boolean {
 
 type TimelineBlock =
   | { type: "single"; item: TimelineItem }
-  | { type: "ops"; id: string; items: TimelineItem[]; streaming: boolean; title: string; count: number; at?: number };
-
-const WORK_GAP_MS = 8_000;
-const WORK_GAP_WITHOUT_DURATION_MS = 20_000;
-
-function itemDuration(item: TimelineItem): number | undefined {
-  return "durationMs" in item ? item.durationMs : undefined;
-}
-
-function workEnd(item: TimelineItem): number | undefined {
-  if (item.at == null) return undefined;
-  return item.at + (itemDuration(item) ?? 0);
-}
-
-function isAdjacentWork(prev: TimelineItem, next: TimelineItem): boolean {
-  if (isLiveItem(prev) || isLiveItem(next)) return true;
-  if (prev.at == null || next.at == null) return true;
-  const prevEnd = workEnd(prev) ?? prev.at;
-  const duration = itemDuration(prev);
-  const slack = duration && duration > 0 ? WORK_GAP_MS : WORK_GAP_WITHOUT_DURATION_MS;
-  return next.at <= prevEnd + slack;
-}
-
-function workTitle(items: TimelineItem[], streaming: boolean): string {
-  const hasThought = items.some((item) => item.kind === "thought");
-  const hasOp = items.some((item) => item.kind === "tool" || item.kind === "plan");
-  if (streaming) {
-    if (hasThought && hasOp) return "正在思考与操作";
-    if (hasOp) return "正在操作";
-    return "正在思考";
-  }
-  if (hasThought && hasOp) return "思考与操作";
-  if (hasOp) return "操作";
-  return "思考过程";
-}
+  | { type: "ops"; id: string; items: TimelineItem[]; streaming: boolean };
 
 function groupTimeline(items: TimelineItem[]): TimelineBlock[] {
   const blocks: TimelineBlock[] = [];
@@ -533,23 +664,17 @@ function groupTimeline(items: TimelineItem[]): TimelineBlock[] {
 
   const flushWork = () => {
     if (!work.length) return;
-    const streaming = work.some(isLiveItem);
     blocks.push({
       type: "ops",
       id: work[0].id,
       items: work,
-      streaming,
-      title: workTitle(work, streaming),
-      count: work.length,
-      at: work[0].at,
+      streaming: work.some(isLiveItem),
     });
     work = [];
   };
 
   for (const item of items) {
-    if (isWorkItem(item)) {
-      const prev = work[work.length - 1];
-      if (prev && !isAdjacentWork(prev, item)) flushWork();
+    if (isActivityItem(item)) {
       work.push(item);
       continue;
     }
@@ -560,16 +685,91 @@ function groupTimeline(items: TimelineItem[]): TimelineBlock[] {
   return blocks;
 }
 
+function baseName(path: string): string {
+  const parts = path.split(/[/\\]/).filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+function diffLineStats(diffs?: ToolDiff[]): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const diff of diffs ?? []) {
+    const oldLines = (diff.oldText ?? "").split("\n");
+    const newLines = (diff.newText ?? "").split("\n");
+    const oldSet = new Set(oldLines);
+    const newSet = new Set(newLines);
+    for (const line of newLines) if (!oldSet.has(line)) added += 1;
+    for (const line of oldLines) if (!newSet.has(line)) removed += 1;
+  }
+  return { added, removed };
+}
+
+type ToolRole = "edit" | "search" | "run" | "read" | "fetch" | "other";
+
+function toolRole(item: Extract<TimelineItem, { kind: "tool" }>): ToolRole {
+  const kind = (item.toolKind ?? "").toLowerCase();
+  const title = item.title.trim();
+  const hay = `${kind} ${title}`.toLowerCase();
+  if (kind === "edit" || kind === "write" || item.diffs?.length || /^\s*edit\b/i.test(title) || /search_replace/.test(hay)) {
+    return "edit";
+  }
+  if (kind === "search" || kind === "grep" || /searched|grep|glob/.test(hay) || /^web search/i.test(title)) return "search";
+  if (kind === "execute" || kind === "terminal" || kind === "bash" || item.background) return "run";
+  if (/run_terminal|\[bg\]|^\s*(run|execute)\s/i.test(hay) || /^(run|execute)\b/i.test(title)) return "run";
+  if (kind === "read" || /^(read|list)\b/i.test(title)) return "read";
+  if (kind === "fetch" || /web_search|fetch|open_page/.test(hay) || /^fetch\b/i.test(title)) return "fetch";
+  return "other";
+}
+
+function thoughtLabel(item: Extract<TimelineItem, { kind: "thought" }>, live: boolean): string {
+  if (item.interrupted) return "Thought interrupted";
+  const duration = formatDuration(
+    item.durationMs ?? (live && item.at != null ? Math.max(0, Date.now() - item.at) : undefined),
+  );
+  if (live && !item.durationMs) return duration ? `Thought for ${duration}` : "Thinking…";
+  return duration ? `Thought for ${duration}` : "Thought";
+}
+
+function toolLabel(item: Extract<TimelineItem, { kind: "tool" }>): { role: ToolRole; text: string; added?: number; removed?: number } {
+  const role = toolRole(item);
+  if (role === "edit") {
+    const fromDiff = item.diffs?.[0]?.path;
+    const tick = item.title.match(/`([^`]+)`/);
+    const name = baseName(fromDiff || tick?.[1] || item.title.replace(/^edit\s+/i, ""));
+    const stats = diffLineStats(item.diffs);
+    return { role, text: `Edit ${name}`, added: stats.added || undefined, removed: stats.removed || undefined };
+  }
+  if (role === "search") {
+    if (/^searched\b/i.test(item.title)) return { role, text: item.title };
+    const count = item.title.match(/(\d+)\s*(pattern|file|match)/i);
+    if (count) {
+      const unit = count[2].toLowerCase();
+      const n = count[1];
+      const plural = n === "1" || /s$/.test(unit) ? unit : `${unit}s`;
+      return { role, text: `Searched ${n} ${plural}` };
+    }
+    return { role, text: item.title };
+  }
+  if (role === "run") {
+    let text = item.title.replace(/^\[bg\]\s*/i, "").replace(/^execute\s+/i, "Run ");
+    if (text.length > 88) text = `${text.slice(0, 85)}…`;
+    return { role, text };
+  }
+  return { role, text: item.title };
+}
+
 function TimelineItemView({
   item,
   selectedId,
   onSelectTool,
   showTimestamps = true,
+  onOpenImage,
 }: {
   item: TimelineItem;
   selectedId?: string;
   onSelectTool: (item: Extract<TimelineItem, { kind: "tool" }>) => void;
   showTimestamps?: boolean;
+  onOpenImage: (path: string, preview?: string, name?: string) => void;
 }) {
   if (item.kind === "user") {
     return (
@@ -579,44 +779,39 @@ function TimelineItemView({
           <Stamp at={item.at} show={showTimestamps} />
         </div>
         <div className="md">
-          {item.text ? (
-            <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-              {item.text}
-            </Markdown>
-          ) : null}
-          <MessageExtras attachments={item.attachments} sessionRefs={item.sessionRefs} />
+          {item.text ? <ChatMarkdown text={item.text} onOpenImage={onOpenImage} /> : null}
+          <MessageExtras
+            attachments={item.attachments}
+            sessionRefs={item.sessionRefs}
+            onOpenImage={onOpenImage}
+          />
         </div>
       </div>
     );
   }
-  if (item.kind === "thought") {
+  if (item.kind === "interrupt") {
     return (
-      <LiveDetails live={item.streaming} className="thought-block">
-        <summary>
-          <FoldChevron />
-          <span>{item.streaming ? "正在思考" : "思考过程"}</span>
-          <Stamp at={item.at} show={showTimestamps} />
-        </summary>
-        <div className="md thought-body">
-          {isBlank(item.text) && item.streaming ? <StreamingDots /> : item.text}
-        </div>
-      </LiveDetails>
+      <div className="turn-interrupt" role="status">
+        <span>已中断</span>
+        {item.durationMs != null ? <em>{formatElapsedClock(item.durationMs)}</em> : null}
+      </div>
     );
+  }
+  if (item.kind === "thought") {
+    return <ThoughtRow item={item} />;
   }
   if (item.kind === "assistant") {
     return (
-      <div className="bubble assistant">
+      <div className={`bubble assistant${item.interrupted ? " interrupted" : ""}`}>
         <div className="kicker">
-          Grok
+          {item.interrupted ? "Grok · 已中断" : "Grok"}
           <Stamp at={item.at} show={showTimestamps} />
         </div>
         <div className="md">
           {isBlank(item.text) && item.streaming ? (
             <StreamingDots />
           ) : (
-            <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-              {item.text}
-            </Markdown>
+            <ChatMarkdown text={item.text} onOpenImage={onOpenImage} />
           )}
         </div>
       </div>
@@ -624,7 +819,7 @@ function TimelineItemView({
   }
   if (item.kind === "tool") {
     return (
-      <ToolCard item={item} active={selectedId === item.id} onSelect={() => onSelectTool(item)} />
+      <ToolRow item={item} active={selectedId === item.id} onSelect={() => onSelectTool(item)} />
     );
   }
   if (item.kind === "plan") {
@@ -649,95 +844,105 @@ function TimelineItemView({
   );
 }
 
-function StepMeta({ item, live }: { item: { at?: number; durationMs?: number; tokens?: number }; live?: boolean }) {
-  const text = formatStepStats(item, live);
-  if (!text) return null;
-  return <span className="op-step-stats">{text}</span>;
+function ThoughtRow({ item }: { item: Extract<TimelineItem, { kind: "thought" }> }) {
+  const live = Boolean(item.streaming);
+  return (
+    <div className={`op-item thought${item.interrupted ? " interrupted" : ""}${live ? " live" : ""}`}>
+      <div className="op-row thought">
+        <span className="op-glyph thought" aria-hidden="true">
+          ◆
+        </span>
+        <span className="op-copy">{thoughtLabel(item, live)}</span>
+      </div>
+      {live ? (
+        <div className="thought-inline">
+          {isBlank(item.text) ? <StreamingDots /> : item.text}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
-function OpTree({
+function ToolRow({
+  item,
+  active,
+  onSelect,
+}: {
+  item: Extract<TimelineItem, { kind: "tool" }>;
+  active: boolean;
+  onSelect: () => void;
+}) {
+  const live = item.status === "pending" || item.status === "in_progress";
+  const { role, text, added, removed } = toolLabel(item);
+  return (
+    <button
+      type="button"
+      className={`op-row ${role} ${live ? "live" : ""} ${item.status} ${active ? "active" : ""}`}
+      onClick={onSelect}
+    >
+      {role === "run" ? (
+        <span className={`op-bar ${live ? "live" : item.status}`} aria-hidden="true" />
+      ) : (
+        <span className={`op-glyph ${role}`} aria-hidden="true">
+          {role === "edit" ? ">" : role === "search" || role === "fetch" ? "◈" : role === "read" ? "·" : "•"}
+        </span>
+      )}
+      <span className="op-copy">
+        {toolTitlePending(item) ? <StreamingDots /> : text}
+        {added || removed ? (
+          <>
+            {" "}
+            <span className="op-diff">
+              {added ? <span className="op-add">+{added}</span> : null}
+              {added && removed ? "/" : null}
+              {removed ? <span className="op-del">-{removed}</span> : null}
+            </span>
+          </>
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+function ActivityStream({
   block,
   selectedId,
   onSelectTool,
-  showTimestamps = true,
 }: {
   block: Extract<TimelineBlock, { type: "ops" }>;
   selectedId?: string;
   onSelectTool: (item: Extract<TimelineItem, { kind: "tool" }>) => void;
-  showTimestamps?: boolean;
 }) {
-  const totals = formatStepStats(aggregateStats(block.items), block.streaming);
   return (
-    <LiveDetails live={block.streaming} className="op-tree">
-      <summary>
-        <FoldChevron />
-        <span className={`op-dot ${block.streaming ? "live" : ""}`} />
-        <span className="op-tree-title">{block.title}</span>
-        <span className="op-tree-count">
-          {block.count} 步{totals ? ` · ${totals}` : ""}
-        </span>
-        <Stamp at={block.at} show={showTimestamps} />
-      </summary>
-      <ol className="op-steps">
-        {block.items.map((item) => {
-          if (item.kind === "thought") {
-            return (
-              <li key={item.id} className="op-step thought">
-                <LiveDetails live={item.streaming}>
-                  <summary>
-                    <FoldChevron />
-                    <span>{item.streaming ? "正在思考" : "思考"}</span>
-                    <StepMeta item={item} live={item.streaming} />
-                  </summary>
-                  <div className="md thought-body">
-                    {isBlank(item.text) && item.streaming ? <StreamingDots /> : item.text}
-                  </div>
-                </LiveDetails>
-              </li>
-            );
-          }
-          if (item.kind === "tool") {
-            const live = item.status === "pending" || item.status === "in_progress";
-            return (
-              <li key={item.id}>
-                <button
-                  type="button"
-                  className={`op-step tool ${selectedId === item.id ? "active" : ""}`}
-                  onClick={() => onSelectTool(item)}
-                >
-                  <span className={`op-dot ${item.status}`} />
-                  <span className="op-step-copy">
-                    {toolTitlePending(item) ? <StreamingDots /> : item.title}
-                  </span>
-                  <StepMeta item={item} live={live} />
-                  <span className={`pill ${item.status}`}>{item.status}</span>
-                </button>
-              </li>
-            );
-          }
-          if (item.kind === "plan") {
-            return (
-              <li key={item.id} className="op-step thought">
-                <details>
-                  <summary>
-                    <FoldChevron />
-                    <span>计划</span>
-                    <StepMeta item={item} />
-                  </summary>
-                  <div className="md thought-body">{item.text}</div>
-                </details>
-              </li>
-            );
-          }
+    <div className={`op-stream${block.streaming ? " live" : ""}`}>
+      {block.items.map((item) => {
+        if (item.kind === "thought") return <ThoughtRow key={item.id} item={item} />;
+        if (item.kind === "tool") {
           return (
-            <li key={item.id} className="op-step note">
-              <span className="op-dot" />
-              <span className="op-step-copy">{item.kind === "system" ? item.text : ""}</span>
-            </li>
+            <ToolRow
+              key={item.id}
+              item={item}
+              active={selectedId === item.id}
+              onSelect={() => onSelectTool(item)}
+            />
           );
-        })}
-      </ol>
-    </LiveDetails>
+        }
+        if (item.kind === "plan") {
+          return (
+            <div key={item.id} className="op-item plan">
+              <div className="op-row">
+                <span className="op-glyph" aria-hidden="true">
+                  ▸
+                </span>
+                <span className="op-copy">Plan</span>
+              </div>
+              <pre className="thought-inline">{item.text}</pre>
+            </div>
+          );
+        }
+        return null;
+      })}
+    </div>
   );
 }
 
@@ -749,6 +954,7 @@ function TimelineView({
   showThoughts = true,
   groupTools = true,
   showTimestamps = true,
+  onOpenImage,
 }: {
   items: TimelineItem[];
   busy?: boolean;
@@ -757,16 +963,14 @@ function TimelineView({
   showThoughts?: boolean;
   groupTools?: boolean;
   showTimestamps?: boolean;
+  onOpenImage: (path: string, preview?: string, name?: string) => void;
 }) {
-  const visible = useMemo(
-    () => (showThoughts ? items : items.filter((item) => item.kind !== "thought")),
-    [items, showThoughts],
-  );
-  const blocks = useMemo(
-    () => (groupTools ? groupTimeline(visible) : visible.map((item) => ({ type: "single" as const, item }))),
-    [visible, groupTools],
-  );
-  const waiting = Boolean(busy) && !visible.some(isLiveItem);
+  const blocks = useMemo(() => {
+    const grouped = groupTools ? groupTimeline(items) : items.map((item) => ({ type: "single" as const, item }));
+    if (showThoughts) return grouped;
+    return grouped.filter((block) => !(block.type === "single" && block.item.kind === "thought"));
+  }, [items, groupTools, showThoughts]);
+  const waiting = Boolean(busy) && !items.some(isLiveItem);
   const lastBlock = blocks[blocks.length - 1];
   const waitingLabel =
     lastBlock?.type === "ops" && lastBlock.items.some((item) => item.kind === "tool")
@@ -777,12 +981,11 @@ function TimelineView({
       {blocks.map((block) => {
         if (block.type === "ops") {
           return (
-            <OpTree
+            <ActivityStream
               key={block.id}
               block={block}
               selectedId={selectedId}
               onSelectTool={onSelectTool}
-              showTimestamps={showTimestamps}
             />
           );
         }
@@ -793,6 +996,7 @@ function TimelineView({
               selectedId={selectedId}
               onSelectTool={onSelectTool}
               showTimestamps={showTimestamps}
+              onOpenImage={onOpenImage}
             />
           </div>
         );
@@ -926,6 +1130,7 @@ function SessionRow({
   session,
   active,
   busy,
+  runningHint,
   menuOpen,
   renaming,
   dragging,
@@ -947,6 +1152,7 @@ function SessionRow({
   session: SessionSummary;
   active: boolean;
   busy?: boolean;
+  runningHint?: string;
   menuOpen: boolean;
   renaming: boolean;
   dragging?: boolean;
@@ -1059,7 +1265,7 @@ function SessionRow({
           className="session-open"
           role="button"
           tabIndex={0}
-          title={busy ? "执行中" : session.title || "未命名对话"}
+          title={busy ? runningHint || "执行中" : session.title || "未命名对话"}
           onClick={() => {
             if (skipClick.current) {
               skipClick.current = false;
@@ -1088,16 +1294,16 @@ function SessionRow({
         >
           <span className="session-title">
             <span className="session-title-text">{session.title || "未命名对话"}</span>
-            {session.interrupted ? <span className="interrupt-chip" title="更新时中断">中断</span> : null}
+            {session.interrupted ? <span className="interrupt-chip" title="本轮被强制打断">中断</span> : null}
             {busy ? (
-              <span className="session-spinner" title="执行中">
+              <span className="session-spinner" title={runningHint || "执行中"}>
                 <Spinner />
               </span>
             ) : session.unread ? (
               <span className="unread-dot" title="未读" />
             ) : null}
           </span>
-          <small>{formatAgo(session.updatedAtMs ?? session.updatedAt)}</small>
+          <small>{runningHint || formatAgo(session.updatedAtMs ?? session.updatedAt)}</small>
         </div>
       )}
       {selecting ? null : (
@@ -1210,6 +1416,7 @@ export function App() {
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
+  const now = useNow(Boolean(state.busy || state.backgroundTasks.length));
   const [draftWorkspace, setDraftWorkspace] = useState("");
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [renamingId, setRenamingId] = useState<string | undefined>();
@@ -1220,6 +1427,8 @@ export function App() {
   const [mentionHits, setMentionHits] = useState<MentionHit[]>([]);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [dropping, setDropping] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [lightbox, setLightbox] = useState<{ path: string; src: string; name?: string } | undefined>();
   const [sidebarDrag, setSidebarDrag] = useState<SidebarDragState | undefined>();
   const sidebarDragRef = useRef<SidebarDragState | undefined>(sidebarDrag);
   sidebarDragRef.current = sidebarDrag;
@@ -1281,6 +1490,15 @@ export function App() {
   useEffect(() => {
     followOutput.current = true;
   }, [state.sessionId]);
+
+  useEffect(() => {
+    if (!lightbox) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setLightbox(undefined);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox]);
 
   useEffect(() => {
     const el = scroller.current;
@@ -1556,6 +1774,11 @@ export function App() {
     if (rows.length) mergeAttachments(rows);
   }
 
+  async function openImage(path: string, preview?: string, name?: string) {
+    const src = (await window.grok.imageDataUrl(path)) || preview || path;
+    setLightbox({ path, src, name });
+  }
+
   async function pickAttachments() {
     const rows = await window.grok.pickFiles();
     if (rows.length) mergeAttachments(rows);
@@ -1624,9 +1847,23 @@ export function App() {
     await addPaths(paths);
   }
 
-  async function send() {
+  async function stopTurn() {
+    setBusyError(undefined);
+    try {
+      setState(await window.grok.cancel());
+    } catch (err) {
+      setBusyError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function send(now = false) {
     const text = draft.trim();
-    if ((!text && !attachments.length && !sessionRefs.length) || state.busy) return;
+    const hasPayload = Boolean(text || attachments.length || sessionRefs.length);
+    if (state.busy && !now && !hasPayload) {
+      if (state.promptQueue.length) setState(await window.grok.sendQueuedNow());
+      return;
+    }
+    if (!hasPayload) return;
     followOutput.current = true;
     const pendingFiles = attachments;
     const pendingRefs = sessionRefs;
@@ -1646,7 +1883,7 @@ export function App() {
         });
         setDraftWorkspace(snap.workspace ?? workspace);
       }
-      setState(await window.grok.send(text, pendingFiles, pendingRefs));
+      setState(await window.grok.send(text, pendingFiles, pendingRefs, now));
     } catch (err) {
       setDraft(text);
       setAttachments(pendingFiles);
@@ -1660,7 +1897,25 @@ export function App() {
     setDraft(command?.hint ? `/${name} ` : `/${name}`);
   }
 
+  function insertComposerNewline(event: KeyboardEvent<HTMLTextAreaElement>) {
+    event.preventDefault();
+    const el = event.currentTarget;
+    const start = el.selectionStart ?? draft.length;
+    const end = el.selectionEnd ?? draft.length;
+    const next = `${draft.slice(0, start)}\n${draft.slice(end)}`;
+    setDraft(next);
+    requestAnimationFrame(() => {
+      el.selectionStart = el.selectionEnd = start + 1;
+    });
+  }
+
   async function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const newline = event.key === "Enter" && (event.ctrlKey || event.metaKey);
+    const plainEnter = event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+    if (newline) {
+      insertComposerNewline(event);
+      return;
+    }
     if (mentionHits.length > 0 && mentionQuery != null) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -1672,7 +1927,7 @@ export function App() {
         setMentionIndex((index) => (index - 1 + mentionHits.length) % mentionHits.length);
         return;
       }
-      if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+      if (event.key === "Tab" || plainEnter) {
         event.preventDefault();
         const hit = mentionHits[mentionIndex] ?? mentionHits[0];
         if (hit) await pickMention(hit);
@@ -1705,15 +1960,11 @@ export function App() {
         setDraft("");
         return;
       }
-      if (event.key === "Enter" && !event.shiftKey) {
+      if (plainEnter) {
         event.preventDefault();
         const hit = slashHits[slashIndex] ?? slashHits[0];
         const typed = draft.slice(1);
         if (typed === hit.name || typed.startsWith(`${hit.name} `)) {
-          if (state.busy) {
-            await window.grok.cancel();
-            return;
-          }
           await send();
           return;
         }
@@ -1721,12 +1972,8 @@ export function App() {
         return;
       }
     }
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (plainEnter) {
       event.preventDefault();
-      if (state.busy) {
-        await window.grok.cancel();
-        return;
-      }
       await send();
     }
   }
@@ -2304,7 +2551,8 @@ export function App() {
                                     key={session.sessionId}
                                     session={session}
                                     active={session.sessionId === state.sessionId}
-                                    busy={state.busy && session.sessionId === state.sessionId}
+                                    busy={sessionLive(session, state)}
+                                    runningHint={formatSessionRunning(session)}
                                     menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
                                     renaming={renamingId === session.sessionId}
                                     onOpen={() => void openSession(session)}
@@ -2325,7 +2573,8 @@ export function App() {
                             key={session.sessionId}
                             session={session}
                             active={session.sessionId === state.sessionId}
-                            busy={state.busy && session.sessionId === state.sessionId}
+                            busy={sessionLive(session, state)}
+                            runningHint={formatSessionRunning(session)}
                             menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
                             renaming={renamingId === session.sessionId}
                             onOpen={() => void openSession(session)}
@@ -2472,7 +2721,8 @@ export function App() {
                       key={session.sessionId}
                       session={session}
                       active={session.sessionId === state.sessionId}
-                      busy={state.busy && session.sessionId === state.sessionId}
+                      busy={sessionLive(session, state)}
+                      runningHint={formatSessionRunning(session)}
                       menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
                       renaming={renamingId === session.sessionId}
                       selecting={archiveSelecting}
@@ -2544,6 +2794,16 @@ export function App() {
                   type="button"
                   onClick={() => {
                     setAccountOpen(false);
+                    setUsageOpen(true);
+                  }}
+                >
+                  Token 消耗
+                </button>
+                <button
+                  className="linkish"
+                  type="button"
+                  onClick={() => {
+                    setAccountOpen(false);
                     setSettingsOpen(true);
                   }}
                 >
@@ -2605,10 +2865,24 @@ export function App() {
         <div className="topbar">
           <div className="topbar-title" title={state.sessionTitle || undefined}>
             <strong>{home ? "新对话" : state.sessionTitle || "未选择对话"}</strong>
-            {state.busy && !home ? (
-              <span className="topbar-spinner" title="执行中">
-                <Spinner />
-              </span>
+            {!home && (state.busy || state.backgroundTasks.length) ? (
+              <>
+                <span
+                  className="topbar-spinner"
+                  title={state.busy ? "执行中" : formatBackgroundLine(state.backgroundTasks)}
+                >
+                  <Spinner />
+                </span>
+                {state.busy ? (
+                  <span className="turn-clock" title="本轮已用时间">
+                    {formatElapsedClock(now - (state.runStats.turnStartedAt ?? now))}
+                  </span>
+                ) : (
+                  <span className="turn-clock" title={state.backgroundTasks.map((task) => task.title).join("\n")}>
+                    {formatBackgroundLine(state.backgroundTasks)}
+                  </span>
+                )}
+              </>
             ) : null}
             {(home ? draftWorkspace : state.workspace) ? (
               <span className="topbar-cwd">{folderLabel((home ? draftWorkspace : state.workspace) ?? "")}</span>
@@ -2692,9 +2966,13 @@ export function App() {
                   onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
                 />
                 <ComposerSubmit
-                  busy={state.busy}
+                  busy={state.busy && !draft.trim() && !attachments.length && !sessionRefs.length}
                   disabled={!draft.trim() && !attachments.length && !sessionRefs.length && !state.busy}
-                  onClick={() => void (state.busy ? window.grok.cancel() : send())}
+                  onClick={() =>
+                    void (state.busy && !draft.trim() && !attachments.length && !sessionRefs.length
+                      ? stopTurn()
+                      : send())
+                  }
                 />
               </div>
             </div>
@@ -2702,6 +2980,7 @@ export function App() {
           </div>
         ) : (
           <>
+            <TasksPane tasks={state.backgroundTasks} now={now} />
             <div
               className="transcript"
               ref={scroller}
@@ -2716,9 +2995,9 @@ export function App() {
               }}
             >
               <div className="thread">
-                {currentSession?.interrupted ? (
+                {currentSession?.updateInterrupted ? (
                   <div className="interrupt-banner">
-                    <span>这次对话在 Grok Build 更新时被中断。</span>
+                    <span>这次对话在 Grok Build 更新时被打断，不是手动中断。</span>
                     <button
                       className="btn ghost tiny"
                       type="button"
@@ -2735,11 +3014,19 @@ export function App() {
                   showThoughts={state.settings.showThinkingBlocks}
                   groupTools={state.settings.groupToolVerbs}
                   showTimestamps={state.settings.showTimestamps}
+                  onOpenImage={(path, preview, name) => void openImage(path, preview, name)}
                   onSelectTool={(item) => {
                     setSelectedToolId(item.id);
                     if (!state.inspectorOpen) void window.grok.setInspectorOpen(true);
                   }}
                 />
+                {!state.busy && (state.runStats.durationMs || state.runStats.tokens) ? (
+                  <div className="session-stats">
+                    本会话
+                    {state.runStats.durationMs ? ` ${formatElapsedClock(state.runStats.durationMs)}` : ""}
+                    {state.runStats.tokens ? ` · ${formatTokens(state.runStats.tokens)} tok` : ""}
+                  </div>
+                ) : null}
                 {(state.error || busyError) && (
                   <div className="bubble">
                     <div className="kicker thought">错误</div>
@@ -2749,6 +3036,22 @@ export function App() {
               </div>
             </div>
             <div className="composer-wrap">
+              <StillRunningLine tasks={state.backgroundTasks} />
+              <PromptQueueBar
+                queue={state.promptQueue}
+                followUp={state.settings.followUpBehavior}
+                holding={Boolean(state.backgroundTasks.length) && !state.busy}
+                combine={state.settings.combineQueuedPrompts}
+                onSendNow={(id) => void window.grok.sendQueuedNow(id).then(setState)}
+                onRemove={(id) => void window.grok.removeQueued(id).then(setState)}
+              />
+              {state.busy ? (
+                <div className="turn-live">
+                  进行中 {formatElapsedClock(now - (state.runStats.turnStartedAt ?? now))}
+                  {state.runStats.tokens ? ` · ${formatTokens(state.runStats.tokens)} tok` : ""}
+                  {state.settings.followUpBehavior === "steer" ? " · 追问将注入空隙" : " · Enter 排队追问"}
+                </div>
+              ) : null}
               {state.permission && (
                 <PermissionBar
                   permission={state.permission}
@@ -2777,7 +3080,7 @@ export function App() {
                 />
                 <textarea
                   value={draft}
-                  placeholder="给 grok 下指令。打 / 可列出命令，打 @ 引用文件或对话。可拖入或粘贴图片、文件。Enter 发送，Shift+Enter 换行。"
+                  placeholder="给 grok 下指令。打 / 可列出命令，打 @ 引用文件或对话。可拖入或粘贴图片、文件。Enter 发送，Ctrl+Enter 换行。"
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => void onComposerKey(e)}
                   onPaste={(e) => void onComposerPaste(e)}
@@ -2795,9 +3098,13 @@ export function App() {
                     onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
                   />
                   <ComposerSubmit
-                    busy={state.busy}
+                    busy={state.busy && !draft.trim() && !attachments.length && !sessionRefs.length}
                     disabled={!draft.trim() && !attachments.length && !sessionRefs.length && !state.busy}
-                    onClick={() => void (state.busy ? window.grok.cancel() : send())}
+                    onClick={() =>
+                      void (state.busy && !draft.trim() && !attachments.length && !sessionRefs.length
+                        ? stopTurn()
+                        : send())
+                    }
                   />
                 </div>
               </div>
@@ -2857,6 +3164,20 @@ export function App() {
             });
           }}
         />
+      )}
+      {usageOpen && <UsagePanel usage={state.tokenUsage} onClose={() => setUsageOpen(false)} />}
+      {lightbox && (
+        <div
+          className="lightbox"
+          role="dialog"
+          onClick={() => setLightbox(undefined)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            if (!/^https?:/i.test(lightbox.path)) void window.grok.imageMenu(lightbox.path);
+          }}
+        >
+          <img src={lightbox.src} alt={lightbox.name || ""} onClick={(event) => event.stopPropagation()} />
+        </div>
       )}
     </div>
   );

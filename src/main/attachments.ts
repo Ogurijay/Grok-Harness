@@ -73,13 +73,29 @@ export function isImageName(name: string): boolean {
 
 function previewFor(filePath: string, kind: PromptAttachment["kind"]): string | undefined {
   if (kind !== "image") return undefined;
-  const image = nativeImage.createFromPath(filePath);
+  return imageDataUrl(filePath, 96);
+}
+
+export function loadNativeImage(filePath: string) {
+  if (filePath.startsWith("data:image/")) return nativeImage.createFromDataURL(filePath);
+  return nativeImage.createFromPath(filePath);
+}
+
+export function imageDataUrl(filePath: string, maxEdge = 2400): string | undefined {
+  const image = loadNativeImage(filePath);
   if (image.isEmpty()) return undefined;
   const { width, height } = image.getSize();
-  const scale = Math.min(1, 96 / Math.max(width, height, 1));
+  const scale = Math.min(1, maxEdge / Math.max(width, height, 1));
   const resized =
     scale < 1 ? image.resize({ width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) }) : image;
   return resized.toDataURL();
+}
+
+export function copyImageToClipboard(filePath: string): boolean {
+  const image = loadNativeImage(filePath);
+  if (image.isEmpty()) return false;
+  clipboard.writeImage(image);
+  return true;
 }
 
 export async function inspectPath(filePath: string): Promise<PromptAttachment | undefined> {

@@ -41,6 +41,17 @@ export function touchStats(item: StepStats, at: number | undefined, totalTokens:
   }
 }
 
+export function formatElapsedClock(ms?: number): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "0h00m00s";
+  const total = Math.floor(ms / 1000);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const clock = `${hours}h${String(minutes).padStart(2, "0")}m${String(seconds).padStart(2, "0")}s`;
+  return days > 0 ? `${days}d${clock}` : clock;
+}
+
 export function formatDuration(ms?: number): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "";
   if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
 import { join } from "node:path";
 import { AgentHost } from "./agent-host";
-import { inspectPaths, saveClipboardImage } from "./attachments";
+import { copyImageToClipboard, imageDataUrl, inspectPaths, saveClipboardImage } from "./attachments";
 import { isGrokSettingKey } from "../shared/grok-settings";
 import type { GroupSort, PromptAttachment, SessionMode, SessionRef, SessionSort } from "../shared/types";
 
@@ -153,14 +153,22 @@ app.whenReady().then(async () => {
     host.setInspectorWidth(Number(width));
     return host.getSnapshot();
   });
-  ipcMain.handle("grok:send", async (_evt, text: string, attachments?: unknown, sessionRefs?: unknown) => {
+  ipcMain.handle("grok:send", async (_evt, text: string, attachments?: unknown, sessionRefs?: unknown, now?: unknown) => {
     const files = Array.isArray(attachments)
       ? (attachments as PromptAttachment[]).filter((row) => row && typeof row.path === "string")
       : [];
     const refs = Array.isArray(sessionRefs)
       ? (sessionRefs as SessionRef[]).filter((row) => row && typeof row.sessionId === "string")
       : [];
-    await host.sendPrompt(String(text ?? ""), files, refs);
+    await host.sendPrompt(String(text ?? ""), files, refs, { now: Boolean(now) });
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:removeQueued", (_evt, id: string) => {
+    host.removeQueued(String(id ?? ""));
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:sendQueuedNow", async (_evt, id?: unknown) => {
+    await host.sendQueuedNow(typeof id === "string" && id ? id : undefined);
     return host.getSnapshot();
   });
   ipcMain.handle("grok:pickFiles", async () => {
@@ -363,6 +371,37 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("grok:copyText", (_evt, text: string) => {
     clipboard.writeText(String(text ?? ""));
+    return true;
+  });
+  ipcMain.handle("grok:copyImage", (_evt, source: string) => {
+    return copyImageToClipboard(String(source ?? ""));
+  });
+  ipcMain.handle("grok:imageDataUrl", (_evt, source: string) => {
+    return imageDataUrl(String(source ?? "")) ?? null;
+  });
+  ipcMain.handle("grok:imageMenu", (_evt, source: string) => {
+    const path = String(source ?? "");
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const menu = Menu.buildFromTemplate([
+      {
+        label: "复制图片",
+        click: () => {
+          copyImageToClipboard(path);
+        },
+      },
+      {
+        label: "复制路径",
+        click: () => clipboard.writeText(path),
+      },
+      { type: "separator" },
+      {
+        label: "打开文件",
+        click: () => {
+          void shell.openPath(path);
+        },
+      },
+    ]);
+    menu.popup({ window: win });
     return true;
   });
   ipcMain.handle("grok:openPath", async (_evt, folder: string) => {

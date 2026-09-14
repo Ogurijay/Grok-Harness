@@ -313,8 +313,8 @@ export const SETTINGS_SECTIONS: { title: string; fields: SettingsField[] }[] = [
         label: "追问行为",
         hint: "[ui] follow_up_behavior",
         options: [
-          { value: "queue", label: "queue" },
-          { value: "steer", label: "steer" },
+          { value: "queue", label: "排队（本轮结束后发送）" },
+          { value: "steer", label: "注入（下一空隙插入）" },
         ],
       },
       { key: "combineQueuedPrompts", kind: "toggle", label: "合并排队追问", hint: "[ui] combine_queued_prompts" },
