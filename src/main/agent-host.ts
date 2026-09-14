@@ -5,11 +5,14 @@ import type {
   AgentUiEvent,
   AppSnapshot,
   JsonValue,
+  MentionHit,
   ModelInfo,
   PermissionOption,
   PermissionRequest,
+  PromptAttachment,
   GroupSort,
   SessionMode,
+  SessionRef,
   SessionSort,
   StartOptions,
   TimelineItem,
@@ -27,6 +30,7 @@ import { normalizeUserText } from "../shared/message-text";
 import { readEventStats, touchStats, type StatsCursor } from "../shared/step-stats";
 import { GROK_SETTINGS_DEFAULTS, isGrokSettingKey, type GrokSettings } from "../shared/grok-settings";
 import { applySetting, loadGrokToml, resolveWorkspace, saveGrokToml, settingsFromToml } from "./grok-config";
+import { buildPromptBlocks, inspectPath, searchWorkspaceFiles } from "./attachments";
 import { checkGrokUpdate, collectAtRisk, installGrokUpdate, recordTranslatedUpdate } from "./grok-update";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -36,6 +40,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function cwdLabel(cwd?: string): string {
+  if (!cwd) return "";
+  const parts = cwd.split(/[/\\]/).filter(Boolean);
+  return parts[parts.length - 1] ?? cwd;
 }
 
 function parseModel(rec: Record<string, unknown>): ModelInfo | undefined {
@@ -784,7 +794,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.2.0" },
+        clientInfo: { name: "grok-harness", version: "0.3.0" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
@@ -940,30 +950,86 @@ export class AgentHost {
     }
   }
 
-  async sendPrompt(text: string): Promise<void> {
+  async searchMentions(query: string): Promise<MentionHit[]> {
+    const q = query.trim().toLowerCase();
+    const hits: MentionHit[] = [];
+    const currentId = this.snapshot.sessionId;
+    const sessions = this.snapshot.sessions
+      .filter((session) => session.sessionId !== currentId && !session.archived)
+      .filter((session) => {
+        if (!q) return true;
+        const hay = `${session.title ?? ""} ${session.cwd ?? ""} ${session.sessionId}`.toLowerCase();
+        return hay.includes(q);
+      })
+      .slice(0, 8);
+    for (const session of sessions) {
+      hits.push({
+        id: `session:${session.sessionId}`,
+        kind: "session",
+        label: session.title || "未命名对话",
+        detail: session.cwd ? cwdLabel(session.cwd) : session.sessionId.slice(0, 8),
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+      });
+    }
+    const workspace = this.snapshot.workspace?.trim();
+    if (workspace) {
+      const files = await searchWorkspaceFiles(workspace, query, 12);
+      hits.push(...files);
+    }
+    return hits;
+  }
+
+  async sendPrompt(text: string, attachments: PromptAttachment[] = [], sessionRefs: SessionRef[] = []): Promise<void> {
     const client = this.client;
     const sessionId = this.snapshot.sessionId;
     if (!client || !sessionId) throw new Error("还没有就绪的会话");
     const trimmed = text.trim();
-    if (!trimmed) return;
+    const files: PromptAttachment[] = [];
+    const seen = new Set<string>();
+    for (const row of attachments) {
+      const item = await inspectPath(row.path);
+      if (!item || seen.has(item.path)) continue;
+      seen.add(item.path);
+      files.push({ ...item, preview: row.preview ?? item.preview });
+    }
+    if (!trimmed && !files.length && !sessionRefs.length) return;
 
     const firstTurn = !this.snapshot.timeline.some((item) => item.kind === "user");
-    const outbound =
-      this.snapshot.sessionMode === "plan" && firstTurn && !trimmed.startsWith("/")
-        ? `/plan ${trimmed}`
-        : trimmed;
-    this.pushItem({ id: randomUUID(), kind: "user", text: trimmed, at: Date.now() });
+    const planPrefix =
+      this.snapshot.sessionMode === "plan" && firstTurn && !trimmed.startsWith("/") ? "/plan " : "";
+    const sessionNotes: string[] = [];
+    for (const ref of sessionRefs.slice(0, 5)) {
+      const note = await this.formatSessionNote(ref);
+      if (note) sessionNotes.push(note);
+    }
+    const { blocks, hasImages } = await buildPromptBlocks({
+      text: `${planPrefix}${trimmed}`,
+      attachments: files,
+      sessionNotes,
+    });
+    if (!blocks.length) return;
+
+    this.pushItem({
+      id: randomUUID(),
+      kind: "user",
+      text: trimmed,
+      at: Date.now(),
+      attachments: files.map(({ preview: _preview, ...rest }) => rest),
+      sessionRefs: sessionRefs.slice(0, 5),
+    });
     if (sessionId) this.db.markRead(sessionId, Date.now());
     this.patch({ busy: true });
     try {
-      const result = await client.request(
-        "session/prompt",
-        {
-          sessionId,
-          prompt: [{ type: "text", text: outbound }],
-        },
-        15 * 60_000,
-      );
+      const sendBlocks = async (prompt: typeof blocks) =>
+        client.request("session/prompt", { sessionId, prompt }, 15 * 60_000);
+      let result: JsonValue | typeof ABSORBED_BY_STREAM;
+      try {
+        result = await sendBlocks(blocks);
+      } catch (err) {
+        if (!hasImages) throw err;
+        result = await sendBlocks(blocks.filter((block) => block.type !== "image"));
+      }
       if (result !== ABSORBED_BY_STREAM) {
         this.finishStreaming();
       }
@@ -980,6 +1046,22 @@ export class AgentHost {
       this.patch({ busy: false });
       this.desktopNotify("turn_complete", "本轮已完成");
     }
+  }
+
+  private async formatSessionNote(ref: SessionRef): Promise<string | undefined> {
+    const known = this.snapshot.sessions.find((session) => session.sessionId === ref.sessionId);
+    const title = ref.title || known?.title || "未命名对话";
+    const cwd = ref.cwd || known?.cwd;
+    const items = await loadSessionTranscript(ref.sessionId, cwd);
+    const lines: string[] = [];
+    for (const item of items) {
+      if (item.kind === "user" && item.text.trim()) lines.push(`User: ${item.text.trim()}`);
+      if (item.kind === "assistant" && item.text.trim()) lines.push(`Grok: ${item.text.trim()}`);
+    }
+    let body = lines.join("\n\n");
+    if (body.length > 8000) body = `…\n${body.slice(-8000)}`;
+    const header = `Referenced conversation: ${title}\nSession: ${ref.sessionId}${cwd ? `\nWorkspace: ${cwd}` : ""}`;
+    return body ? `${header}\n\n${body}` : header;
   }
 
   async cancel(): Promise<void> {
@@ -1106,6 +1188,7 @@ export class AgentHost {
       if (this.snapshot.timeline.some((item) => item.kind === "user" && item.text === text)) return;
       const last = [...this.snapshot.timeline].reverse().find((item) => item.kind === "user");
       if (last && last.kind === "user") {
+        if ((last.attachments?.length || last.sessionRefs?.length) && !last.text) return;
         if (text.startsWith(last.text) || last.text.startsWith(text)) {
           if (text.length > last.text.length) this.patchItem(last.id, { text });
           return;

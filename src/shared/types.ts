@@ -22,8 +22,36 @@ export type ToolDiff = {
   newText?: string;
 };
 
+export type AttachmentKind = "image" | "file";
+
+export type PromptAttachment = {
+  id: string;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  kind: AttachmentKind;
+  preview?: string;
+};
+
+export type MentionHit = {
+  id: string;
+  kind: "file" | "session";
+  label: string;
+  detail?: string;
+  path?: string;
+  sessionId?: string;
+  cwd?: string;
+};
+
+export type SessionRef = {
+  sessionId: string;
+  title: string;
+  cwd?: string;
+};
+
 export type TimelineItem =
-  | { id: string; kind: "user"; text: string; at?: number }
+  | { id: string; kind: "user"; text: string; at?: number; attachments?: PromptAttachment[]; sessionRefs?: SessionRef[] }
   | { id: string; kind: "thought"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number }
   | { id: string; kind: "assistant"; text: string; streaming?: boolean; at?: number; durationMs?: number; tokens?: number }
   | {

@@ -1,5 +1,15 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AgentUiEvent, AppSnapshot, GroupSort, SessionMode, SessionSort, StartOptions } from "../shared/types";
+import type {
+  AgentUiEvent,
+  AppSnapshot,
+  GroupSort,
+  MentionHit,
+  PromptAttachment,
+  SessionMode,
+  SessionRef,
+  SessionSort,
+  StartOptions,
+} from "../shared/types";
 import type { GrokSettings } from "../shared/grok-settings";
 
 export type GrokApi = {
@@ -9,7 +19,11 @@ export type GrokApi = {
   beginNewChat: (workspace?: string) => Promise<AppSnapshot>;
   setWorkspace: (folder: string) => Promise<AppSnapshot>;
   setInspectorWidth: (width: number) => Promise<AppSnapshot>;
-  send: (text: string) => Promise<AppSnapshot>;
+  send: (text: string, attachments?: PromptAttachment[], sessionRefs?: SessionRef[]) => Promise<AppSnapshot>;
+  pickFiles: () => Promise<PromptAttachment[]>;
+  inspectPaths: (paths: string[]) => Promise<PromptAttachment[]>;
+  saveClipboardImage: () => Promise<PromptAttachment | null>;
+  searchMentions: (query: string) => Promise<MentionHit[]>;
   cancel: () => Promise<AppSnapshot>;
   permission: (requestId: string, optionId: string | null) => Promise<AppSnapshot>;
   loadSession: (sessionId: string, cwd?: string) => Promise<AppSnapshot>;
@@ -51,7 +65,11 @@ const api: GrokApi = {
   beginNewChat: (workspace) => ipcRenderer.invoke("grok:beginNewChat", workspace),
   setWorkspace: (folder) => ipcRenderer.invoke("grok:setWorkspace", folder),
   setInspectorWidth: (width) => ipcRenderer.invoke("grok:setInspectorWidth", width),
-  send: (text) => ipcRenderer.invoke("grok:send", text),
+  send: (text, attachments, sessionRefs) => ipcRenderer.invoke("grok:send", text, attachments, sessionRefs),
+  pickFiles: () => ipcRenderer.invoke("grok:pickFiles"),
+  inspectPaths: (paths) => ipcRenderer.invoke("grok:inspectPaths", paths),
+  saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
+  searchMentions: (query) => ipcRenderer.invoke("grok:searchMentions", query),
   cancel: () => ipcRenderer.invoke("grok:cancel"),
   permission: (requestId, optionId) => ipcRenderer.invoke("grok:permission", requestId, optionId),
   loadSession: (sessionId, cwd) => ipcRenderer.invoke("grok:loadSession", sessionId, cwd),

@@ -6,6 +6,24 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.3.0 — 2026-09-14
+
+### 中文
+
+- 对话可上传、拖入、粘贴截图/图片/文件，Grok 按附件内容继续工作。
+- 输入 `@` 可引用工作区文件或其他对话，被引用对话的摘要会带进这一轮。
+- 思考与操作按时间插在对话对应位置；间隔较久的步骤不再并进同一组。
+- Markdown 表格带单元格边框和表头底色。
+
+### English
+
+- Attach screenshots, images, and files from the picker, drag-and-drop, or paste; Grok works from that content.
+- Type `@` to mention workspace files or other conversations; a referenced chat’s excerpt is included in the turn.
+- Thinking and tool steps stay at their timestamps; bursts separated in time are no longer merged into one block.
+- Markdown tables render with cell borders and a header background.
+
+---
+
 ## 0.2.0 — 2026-09-14
 
 ### 中文

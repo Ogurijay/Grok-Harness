@@ -1,8 +1,9 @@
 import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
 import { join } from "node:path";
 import { AgentHost } from "./agent-host";
+import { inspectPaths, saveClipboardImage } from "./attachments";
 import { isGrokSettingKey } from "../shared/grok-settings";
-import type { GroupSort, SessionMode, SessionSort } from "../shared/types";
+import type { GroupSort, PromptAttachment, SessionMode, SessionRef, SessionSort } from "../shared/types";
 
 const host = new AgentHost();
 let mainWindow: BrowserWindow | undefined;
@@ -152,9 +153,40 @@ app.whenReady().then(async () => {
     host.setInspectorWidth(Number(width));
     return host.getSnapshot();
   });
-  ipcMain.handle("grok:send", async (_evt, text: string) => {
-    await host.sendPrompt(String(text ?? ""));
+  ipcMain.handle("grok:send", async (_evt, text: string, attachments?: unknown, sessionRefs?: unknown) => {
+    const files = Array.isArray(attachments)
+      ? (attachments as PromptAttachment[]).filter((row) => row && typeof row.path === "string")
+      : [];
+    const refs = Array.isArray(sessionRefs)
+      ? (sessionRefs as SessionRef[]).filter((row) => row && typeof row.sessionId === "string")
+      : [];
+    await host.sendPrompt(String(text ?? ""), files, refs);
     return host.getSnapshot();
+  });
+  ipcMain.handle("grok:pickFiles", async () => {
+    const win = mainWindow;
+    const options: Electron.OpenDialogOptions = {
+      title: "添加文件",
+      properties: ["openFile", "multiSelections"],
+      filters: [
+        { name: "全部文件", extensions: ["*"] },
+        { name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] },
+      ],
+    };
+    const result =
+      win && !win.isDestroyed()
+        ? await dialog.showOpenDialog(win, options)
+        : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths.length) return [];
+    return inspectPaths(result.filePaths);
+  });
+  ipcMain.handle("grok:inspectPaths", async (_evt, paths: unknown) => {
+    const list = Array.isArray(paths) ? paths.map(String) : [];
+    return inspectPaths(list);
+  });
+  ipcMain.handle("grok:saveClipboardImage", () => saveClipboardImage() ?? null);
+  ipcMain.handle("grok:searchMentions", async (_evt, query: unknown) => {
+    return host.searchMentions(String(query ?? ""));
   });
   ipcMain.handle("grok:cancel", async () => {
     await host.cancel();
