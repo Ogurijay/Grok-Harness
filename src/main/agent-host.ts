@@ -26,7 +26,7 @@ import { mergeSlashCommands, parseSlashCommands } from "../shared/slash";
 import { normalizeUserText } from "../shared/message-text";
 import { readEventStats, touchStats, type StatsCursor } from "../shared/step-stats";
 import { GROK_SETTINGS_DEFAULTS, isGrokSettingKey, type GrokSettings } from "../shared/grok-settings";
-import { applySetting, loadGrokToml, saveGrokToml, settingsFromToml } from "./grok-config";
+import { applySetting, loadGrokToml, resolveWorkspace, saveGrokToml, settingsFromToml } from "./grok-config";
 import { checkGrokUpdate, collectAtRisk, installGrokUpdate, recordTranslatedUpdate } from "./grok-update";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -138,6 +138,8 @@ export class AgentHost {
     hiddenGroups: [],
     groupSort: "recent",
     sessionSort: "recent",
+    groupOrder: [],
+    sessionOrder: {},
     account: { connection: "idle" },
     commands: mergeSlashCommands(),
     settings: GROK_SETTINGS_DEFAULTS,
@@ -199,6 +201,8 @@ export class AgentHost {
       hiddenGroups: this.readHiddenGroups(),
       groupSort: parseGroupSort(this.readSidebarPrefs()?.groupSort ?? this.db.getKv("groupSort")),
       sessionSort: parseSessionSort(this.readSidebarPrefs()?.sessionSort ?? this.db.getKv("sessionSort")),
+      groupOrder: this.readGroupOrder(),
+      sessionOrder: this.readSessionOrder(),
       alwaysApprove: this.db.getBool("alwaysApprove", false),
       sessionMode: (this.db.getKv("lastMode") as SessionMode | undefined) ?? "ask",
       workspace: this.db.getKv("lastWorkspace"),
@@ -491,6 +495,26 @@ export class AgentHost {
     }
   }
 
+  async deleteArchivedSessions(sessionIds?: string[]): Promise<void> {
+    const allow = new Set(
+      this.snapshot.sessions.filter((session) => session.archived).map((session) => session.sessionId),
+    );
+    const ids = [
+      ...new Set(
+        (sessionIds?.length ? sessionIds : [...allow]).map(String).filter((id) => allow.has(id)),
+      ),
+    ];
+    const errors: string[] = [];
+    for (const id of ids) {
+      try {
+        await this.deleteSession(id);
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (errors.length) throw new Error(errors[0] ?? "部分会话删除失败");
+  }
+
   setSidebarCollapsed(collapsed: boolean): void {
     this.db.setKv("sidebarCollapsed", collapsed ? "1" : "0");
     this.patch({ sidebarCollapsed: collapsed });
@@ -595,6 +619,32 @@ export class AgentHost {
     this.patch({ groupSort: nextGroup, sessionSort: nextSession });
   }
 
+  reorderGroups(keys: string[]): void {
+    const groupOrder = this.uniqueKeys(keys);
+    this.writeSidebarPrefs({ groupSort: "custom", groupOrder });
+    this.patch({ groupSort: "custom", groupOrder });
+  }
+
+  reorderSessions(groupKey: string, ids: string[]): void {
+    const key = normalizeGroupKey(groupKey);
+    const sessionOrder = {
+      ...this.snapshot.sessionOrder,
+      [key]: [...new Set(ids.map((id) => String(id ?? "").trim()).filter(Boolean))],
+    };
+    this.writeSidebarPrefs({ sessionSort: "custom", sessionOrder });
+    this.patch({ sessionSort: "custom", sessionOrder });
+  }
+
+  reorderSessionsBulk(order: Record<string, string[]>): void {
+    const sessionOrder = { ...this.snapshot.sessionOrder };
+    for (const [key, ids] of Object.entries(order ?? {})) {
+      if (!Array.isArray(ids)) continue;
+      sessionOrder[normalizeGroupKey(key)] = [...new Set(ids.map((id) => String(id ?? "").trim()).filter(Boolean))];
+    }
+    this.writeSidebarPrefs({ sessionSort: "custom", sessionOrder });
+    this.patch({ sessionSort: "custom", sessionOrder });
+  }
+
   private uniqueKeys(keys: string[]): string[] {
     const out: string[] = [];
     const seen = new Set<string>();
@@ -609,8 +659,30 @@ export class AgentHost {
     return out;
   }
 
-  private readSidebarPrefs(): { collapsedGroups?: string[]; groupSort?: string; sessionSort?: string } | undefined {
+  private readSidebarPrefs(): {
+    collapsedGroups?: string[];
+    groupSort?: string;
+    sessionSort?: string;
+    groupOrder?: string[];
+    sessionOrder?: Record<string, string[]>;
+  } | undefined {
     return this.db.getJson("sidebarPrefs", undefined);
+  }
+
+  private readGroupOrder(): string[] {
+    const raw = this.readSidebarPrefs()?.groupOrder ?? this.db.getJson<string[]>("groupOrder", []);
+    return this.uniqueKeys(Array.isArray(raw) ? raw : []);
+  }
+
+  private readSessionOrder(): Record<string, string[]> {
+    const raw = this.readSidebarPrefs()?.sessionOrder ?? this.db.getJson<Record<string, string[]>>("sessionOrder", {});
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Record<string, string[]> = {};
+    for (const [key, ids] of Object.entries(raw)) {
+      if (!Array.isArray(ids)) continue;
+      out[normalizeGroupKey(key)] = [...new Set(ids.map((id) => String(id ?? "").trim()).filter(Boolean))];
+    }
+    return out;
   }
 
   private readCollapsedGroups(): string[] {
@@ -623,15 +695,25 @@ export class AgentHost {
     return this.uniqueKeys(this.db.getJson<string[]>("hiddenGroups", []));
   }
 
-  private writeSidebarPrefs(partial: { collapsedGroups?: string[]; groupSort?: GroupSort; sessionSort?: SessionSort }): void {
+  private writeSidebarPrefs(partial: {
+    collapsedGroups?: string[];
+    groupSort?: GroupSort;
+    sessionSort?: SessionSort;
+    groupOrder?: string[];
+    sessionOrder?: Record<string, string[]>;
+  }): void {
     const collapsedGroups = partial.collapsedGroups ?? this.snapshot.collapsedGroups;
     const groupSort = partial.groupSort ?? this.snapshot.groupSort;
     const sessionSort = partial.sessionSort ?? this.snapshot.sessionSort;
-    const prefs = { collapsedGroups, groupSort, sessionSort };
+    const groupOrder = partial.groupOrder ?? this.snapshot.groupOrder;
+    const sessionOrder = partial.sessionOrder ?? this.snapshot.sessionOrder;
+    const prefs = { collapsedGroups, groupSort, sessionSort, groupOrder, sessionOrder };
     this.db.setKv("sidebarPrefs", JSON.stringify(prefs));
     this.db.setKv("collapsedGroups", JSON.stringify(collapsedGroups));
     this.db.setKv("groupSort", groupSort);
     this.db.setKv("sessionSort", sessionSort);
+    this.db.setKv("groupOrder", JSON.stringify(groupOrder));
+    this.db.setKv("sessionOrder", JSON.stringify(sessionOrder));
   }
 
   async refreshAccount(): Promise<void> {
@@ -702,7 +784,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.1.1" },
+        clientInfo: { name: "grok-harness", version: "0.2.0" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
@@ -751,20 +833,21 @@ export class AgentHost {
   }
 
   async start(workspace: string, options: boolean | StartOptions | Record<string, unknown> = false): Promise<void> {
+    const cwd = resolveWorkspace(workspace);
     const opts: StartOptions =
       typeof options === "boolean"
-        ? { workspace, mode: options ? "yolo" : "ask" }
-        : { ...(options as StartOptions), workspace };
+        ? { workspace: cwd, mode: options ? "yolo" : "ask" }
+        : { ...(options as StartOptions), workspace: cwd };
     const mode: SessionMode = opts.mode ?? "ask";
     const alwaysApprove = mode === "yolo";
     this.statsCursor = {};
-    this.db.setKv("lastWorkspace", workspace);
-    this.revealWorkspace(workspace);
+    this.db.setKv("lastWorkspace", cwd);
+    this.revealWorkspace(cwd);
     this.db.setKv("lastMode", mode);
     if (opts.modelId) this.db.setKv("lastModelId", opts.modelId);
     if (opts.effort) this.db.setKv("lastEffort", opts.effort);
     this.patch({
-      workspace,
+      workspace: cwd,
       sessionId: undefined,
       timeline: [],
       permission: undefined,
@@ -779,7 +862,7 @@ export class AgentHost {
       const client = await this.ensureConnected(alwaysApprove);
       const created = asRecord(
         await client.request("session/new", {
-          cwd: workspace,
+          cwd,
           mcpServers: [],
           _meta: {
             yoloMode: alwaysApprove,
@@ -794,7 +877,7 @@ export class AgentHost {
       this.patch({
         connection: "ready",
         sessionId,
-        workspace,
+        workspace: cwd,
         alwaysApprove,
         sessionMode: mode,
         sessionTitle: "新会话",

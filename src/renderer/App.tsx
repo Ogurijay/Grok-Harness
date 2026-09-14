@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -35,12 +35,15 @@ const empty: AppSnapshot = {
   hiddenGroups: [],
   groupSort: "recent",
   sessionSort: "recent",
+  groupOrder: [],
+  sessionOrder: {},
   account: { connection: "idle" },
   commands: [],
   settings: GROK_SETTINGS_DEFAULTS,
 };
 
 const GROUP_SORT_OPTIONS: { id: GroupSort; label: string }[] = [
+  { id: "custom", label: "自定义排列" },
   { id: "recent", label: "最近活动" },
   { id: "name-asc", label: "名称 A→Z" },
   { id: "name-desc", label: "名称 Z→A" },
@@ -48,10 +51,38 @@ const GROUP_SORT_OPTIONS: { id: GroupSort; label: string }[] = [
 ];
 
 const SESSION_SORT_OPTIONS: { id: SessionSort; label: string }[] = [
+  { id: "custom", label: "自定义排列" },
   { id: "recent", label: "最近活动" },
   { id: "title-asc", label: "名称 A→Z" },
   { id: "title-desc", label: "名称 Z→A" },
 ];
+
+const DRAG_MIME = "application/x-grok-sidebar";
+
+type SidebarDrag =
+  | { kind: "group"; key: string }
+  | { kind: "session"; id: string; groupKey: string };
+
+type SidebarDragState = SidebarDrag & { overId?: string; edge?: "before" | "after" };
+
+function moveKey(order: string[], from: string, to: string, edge: "before" | "after"): string[] {
+  if (from === to) return order;
+  const next = order.filter((key) => key !== from);
+  const index = next.indexOf(to);
+  if (index < 0) return [...next, from];
+  next.splice(edge === "before" ? index : index + 1, 0, from);
+  return next;
+}
+
+function mergeOrder(visual: string[], stored: string[]): string[] {
+  const seen = new Set(visual);
+  return [...visual, ...stored.filter((key) => !seen.has(key))];
+}
+
+function dropEdge(event: DragEvent, el: HTMLElement): "before" | "after" {
+  const rect = el.getBoundingClientRect();
+  return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+}
 
 function Spinner({ size = 12 }: { size?: number }) {
   return (
@@ -154,6 +185,20 @@ function Fold({ collapsed, children }: { collapsed: boolean; children: ReactNode
   );
 }
 
+function CheckIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M3.4 8.3 6.5 11.4 12.6 4.6"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function PinIcon({ filled = false }: { filled?: boolean }) {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -245,7 +290,7 @@ function ToolCard({
   return (
     <article className="tool" onClick={onSelect} data-active={active}>
       <header>
-        <h3>{item.title}</h3>
+        <h3>{toolTitlePending(item) ? <StreamingDots /> : item.title}</h3>
         <span className={`pill ${item.status}`}>{item.status}</span>
       </header>
     </article>
@@ -255,6 +300,58 @@ function ToolCard({
 function Stamp({ at, show = true }: { at?: number; show?: boolean }) {
   if (!show || !at) return null;
   return <time className="stamp">{formatClock(at)}</time>;
+}
+
+function StreamingDots() {
+  return (
+    <span className="stream-dots" aria-hidden="true">
+      <span>.</span>
+      <span>.</span>
+      <span>.</span>
+    </span>
+  );
+}
+
+function StreamPlaceholder({ label }: { label: string }) {
+  return (
+    <div className="stream-placeholder" role="status" aria-live="polite" aria-label={label}>
+      <div className="stream-placeholder-label">{label}</div>
+      <div className="stream-placeholder-dialog">
+        <StreamingDots />
+      </div>
+    </div>
+  );
+}
+
+function LiveDetails({
+  live,
+  className,
+  children,
+}: {
+  live?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDetailsElement>(null);
+  useLayoutEffect(() => {
+    if (live && ref.current) ref.current.open = true;
+  }, [live]);
+  return (
+    <details ref={ref} className={`${className ?? ""}${live ? " stream-live" : ""}`.trim()}>
+      {children}
+    </details>
+  );
+}
+
+function isBlank(text?: string) {
+  return !text || !text.trim();
+}
+
+function toolTitlePending(item: Extract<TimelineItem, { kind: "tool" }>) {
+  const live = item.status === "pending" || item.status === "in_progress";
+  if (!live) return false;
+  const title = item.title.trim();
+  return !title || title === "tool";
 }
 
 function isWorkItem(item: TimelineItem): boolean {
@@ -328,14 +425,16 @@ function TimelineItemView({
   }
   if (item.kind === "thought") {
     return (
-      <details className="thought-block" {...(item.streaming ? { open: true } : {})}>
+      <LiveDetails live={item.streaming} className="thought-block">
         <summary>
           <FoldChevron />
           <span>{item.streaming ? "正在思考" : "思考过程"}</span>
           <Stamp at={item.at} show={showTimestamps} />
         </summary>
-        <div className="md thought-body">{item.text}</div>
-      </details>
+        <div className="md thought-body">
+          {isBlank(item.text) && item.streaming ? <StreamingDots /> : item.text}
+        </div>
+      </LiveDetails>
     );
   }
   if (item.kind === "assistant") {
@@ -346,9 +445,13 @@ function TimelineItemView({
           <Stamp at={item.at} show={showTimestamps} />
         </div>
         <div className="md">
-          <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-            {item.text}
-          </Markdown>
+          {isBlank(item.text) && item.streaming ? (
+            <StreamingDots />
+          ) : (
+            <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              {item.text}
+            </Markdown>
+          )}
         </div>
       </div>
     );
@@ -397,7 +500,7 @@ function OpTree({
 }) {
   const totals = formatStepStats(aggregateStats(block.items), block.streaming);
   return (
-    <details className="op-tree" {...(block.streaming ? { open: true } : {})}>
+    <LiveDetails live={block.streaming} className="op-tree">
       <summary>
         <FoldChevron />
         <span className={`op-dot ${block.streaming ? "live" : ""}`} />
@@ -411,14 +514,16 @@ function OpTree({
           if (item.kind === "thought") {
             return (
               <li key={item.id} className="op-step thought">
-                <details {...(item.streaming ? { open: true } : {})}>
+                <LiveDetails live={item.streaming}>
                   <summary>
                     <FoldChevron />
                     <span>{item.streaming ? "正在思考" : "思考"}</span>
                     <StepMeta item={item} live={item.streaming} />
                   </summary>
-                  <div className="md thought-body">{item.text}</div>
-                </details>
+                  <div className="md thought-body">
+                    {isBlank(item.text) && item.streaming ? <StreamingDots /> : item.text}
+                  </div>
+                </LiveDetails>
               </li>
             );
           }
@@ -432,7 +537,9 @@ function OpTree({
                   onClick={() => onSelectTool(item)}
                 >
                   <span className={`op-dot ${item.status}`} />
-                  <span className="op-step-copy">{item.title}</span>
+                  <span className="op-step-copy">
+                    {toolTitlePending(item) ? <StreamingDots /> : item.title}
+                  </span>
                   <StepMeta item={item} live={live} />
                   <span className={`pill ${item.status}`}>{item.status}</span>
                 </button>
@@ -461,7 +568,7 @@ function OpTree({
           );
         })}
       </ol>
-    </details>
+    </LiveDetails>
   );
 }
 
@@ -491,13 +598,18 @@ function TimelineView({
     [visible, groupTools],
   );
   const waiting = Boolean(busy) && !visible.some(isLiveItem);
+  const lastBlock = blocks[blocks.length - 1];
+  const waitingLabel =
+    lastBlock?.type === "ops" && lastBlock.items.some((item) => item.kind === "tool")
+      ? "正在操作"
+      : "正在思考";
   return (
     <>
       {blocks.map((block) => {
         if (block.type === "ops") {
           return (
             <OpTree
-              key={`${block.id}-${block.streaming ? "live" : "done"}`}
+              key={block.id}
               block={block}
               selectedId={selectedId}
               onSelectTool={onSelectTool}
@@ -515,12 +627,7 @@ function TimelineView({
           </div>
         );
       })}
-      {waiting ? (
-        <div className="turn-loading" aria-live="polite">
-          <Spinner />
-          <span>正在执行</span>
-        </div>
-      ) : null}
+      {waiting ? <StreamPlaceholder label={waitingLabel} /> : null}
     </>
   );
 }
@@ -651,27 +758,46 @@ function SessionRow({
   busy,
   menuOpen,
   renaming,
+  dragging,
+  dropEdge: edge,
+  selecting,
+  selected,
   onOpen,
   onPin,
   onMenu,
   onStartRename,
   onRename,
   onCancelRename,
+  onToggleSelect,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd,
 }: {
   session: SessionSummary;
   active: boolean;
   busy?: boolean;
   menuOpen: boolean;
   renaming: boolean;
+  dragging?: boolean;
+  dropEdge?: "before" | "after";
+  selecting?: boolean;
+  selected?: boolean;
   onOpen: () => void;
   onPin: (event: MouseEvent) => void;
   onMenu: (event: MouseEvent) => void;
   onStartRename: () => void;
   onRename: (title: string) => void;
   onCancelRename: () => void;
+  onToggleSelect?: () => void;
+  onDragStart?: (event: DragEvent<HTMLDivElement>) => void;
+  onDragOver?: (event: DragEvent<HTMLDivElement>) => void;
+  onDrop?: (event: DragEvent<HTMLDivElement>) => void;
+  onDragEnd?: () => void;
 }) {
   const openTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipBlur = useRef(false);
+  const skipClick = useRef(false);
   const [draftTitle, setDraftTitle] = useState(session.title || "");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -702,10 +828,37 @@ function SessionRow({
 
   return (
     <div
-      className={`session-row ${active ? "active" : ""} ${busy ? "busy" : ""} ${menuOpen ? "menu-open" : ""} ${renaming ? "renaming" : ""}`}
+      className={`session-row ${active ? "active" : ""} ${busy ? "busy" : ""} ${menuOpen ? "menu-open" : ""} ${renaming ? "renaming" : ""} ${dragging ? "dragging" : ""} ${edge ? `drop-${edge}` : ""} ${selecting ? "selecting" : ""} ${selected ? "selected" : ""}`}
       aria-busy={busy || undefined}
+      aria-selected={selecting ? selected : undefined}
+      draggable={!renaming && !selecting}
       onContextMenu={onMenu}
+      onDragStart={(event) => {
+        skipClick.current = true;
+        onDragStart?.(event);
+      }}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+      onDragEnd={() => {
+        skipClick.current = true;
+        onDragEnd?.();
+      }}
     >
+      {selecting ? (
+        <button
+          className={`session-check ${selected ? "on" : ""}`}
+          type="button"
+          draggable={false}
+          aria-pressed={selected}
+          title={selected ? "取消选择" : "选择"}
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggleSelect?.();
+          }}
+        >
+          {selected ? <CheckIcon /> : null}
+        </button>
+      ) : null}
       {renaming ? (
         <div className="session-open">
           <input
@@ -732,19 +885,35 @@ function SessionRow({
           <small>{formatAgo(session.updatedAtMs ?? session.updatedAt)}</small>
         </div>
       ) : (
-        <button
+        <div
           className="session-open"
-          type="button"
+          role="button"
+          tabIndex={0}
           title={busy ? "执行中" : session.title || "未命名对话"}
           onClick={() => {
+            if (skipClick.current) {
+              skipClick.current = false;
+              return;
+            }
+            if (selecting) {
+              onToggleSelect?.();
+              return;
+            }
             clearTimeout(openTimer.current);
             openTimer.current = setTimeout(() => onOpen(), 280);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              if (selecting) onToggleSelect?.();
+              else onOpen();
+            }
           }}
           onDoubleClick={(event) => {
             event.preventDefault();
             event.stopPropagation();
             clearTimeout(openTimer.current);
-            onStartRename();
+            if (!selecting) onStartRename();
           }}
         >
           <span className="session-title">
@@ -759,16 +928,18 @@ function SessionRow({
             ) : null}
           </span>
           <small>{formatAgo(session.updatedAtMs ?? session.updatedAt)}</small>
-        </button>
+        </div>
       )}
-      <div className="session-actions">
-        <button className={`pin ${session.pinned ? "on" : ""}`} type="button" title={session.pinned ? "取消置顶" : "置顶"} onClick={onPin}>
-          <PinIcon filled={Boolean(session.pinned)} />
-        </button>
-        <button className="kebab" type="button" title="会话操作" onClick={onMenu}>
-          ⋯
-        </button>
-      </div>
+      {selecting ? null : (
+        <div className="session-actions">
+          <button className={`pin ${session.pinned ? "on" : ""}`} type="button" title={session.pinned ? "取消置顶" : "置顶"} draggable={false} onClick={onPin}>
+            <PinIcon filled={Boolean(session.pinned)} />
+          </button>
+          <button className="kebab" type="button" title="会话操作" draggable={false} onClick={onMenu}>
+            ⋯
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -868,9 +1039,16 @@ export function App() {
   const [hover, setHover] = useState<{ group: SessionGroup; x: number; y: number } | undefined>();
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
+  const followOutput = useRef(true);
   const [draftWorkspace, setDraftWorkspace] = useState("");
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [renamingId, setRenamingId] = useState<string | undefined>();
+  const [archiveSelecting, setArchiveSelecting] = useState(false);
+  const [archiveSelected, setArchiveSelected] = useState<Set<string>>(() => new Set());
+  const [sidebarDrag, setSidebarDrag] = useState<SidebarDragState | undefined>();
+  const sidebarDragRef = useRef<SidebarDragState | undefined>(sidebarDrag);
+  sidebarDragRef.current = sidebarDrag;
+  const skipGroupClick = useRef(false);
   const inspectorWidthRef = useRef(320);
   const resizing = useRef(false);
   const slashQuery = useMemo(() => {
@@ -902,17 +1080,46 @@ export function App() {
     if (state.inspectorWidth) setInspectorWidth(state.inspectorWidth);
   }, [state.inspectorWidth]);
 
-  const lastTimeline = state.timeline[state.timeline.length - 1];
-  const timelineTail =
-    lastTimeline && "text" in lastTimeline
-      ? `${lastTimeline.id}:${lastTimeline.text.length}`
-      : lastTimeline?.id;
   useEffect(() => {
-    if (!state.settings.pageFlipOnSend) return;
+    followOutput.current = true;
+  }, [state.sessionId]);
+
+  useEffect(() => {
     const el = scroller.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [state.timeline.length, timelineTail, state.busy, state.settings.pageFlipOnSend]);
+    const follow = state.settings.pageFlipOnSend;
+    const nearBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight <= 120;
+    let frame = 0;
+    let pinning = false;
+    const onScroll = () => {
+      if (pinning) return;
+      followOutput.current = nearBottom();
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    const pin = () => {
+      frame = 0;
+      if (!follow || !followOutput.current) return;
+      const top = el.scrollHeight - el.clientHeight;
+      if (Math.abs(el.scrollTop - top) <= 1) return;
+      pinning = true;
+      el.scrollTop = top;
+      pinning = false;
+    };
+    const schedule = () => {
+      if (!follow || !followOutput.current || frame) return;
+      frame = requestAnimationFrame(pin);
+    };
+    const inner = el.querySelector(".thread");
+    const ro = new ResizeObserver(schedule);
+    if (inner) ro.observe(inner);
+    ro.observe(el);
+    schedule();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [state.sessionId, state.settings.pageFlipOnSend]);
 
   useEffect(() => {
     if (!menu) return;
@@ -1017,6 +1224,7 @@ export function App() {
 
   async function openSession(session: SessionSummary) {
     setBusyError(undefined);
+    followOutput.current = true;
     try {
       setState(await window.grok.openSession(session.sessionId, session.cwd));
     } catch (err) {
@@ -1084,6 +1292,41 @@ export function App() {
     }
   }
 
+  function toggleArchiveSelected(sessionId: string) {
+    setArchiveSelecting(true);
+    setArchiveSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  }
+
+  function exitArchiveSelect() {
+    setArchiveSelecting(false);
+    setArchiveSelected(new Set());
+  }
+
+  async function beginArchiveSelect() {
+    setMenu(undefined);
+    setArchiveSelecting(true);
+    if (state.collapsedGroups.includes("__archived__")) {
+      setState(await window.grok.toggleGroup("__archived__"));
+    }
+  }
+
+  async function deleteArchivedSessions(ids?: string[]) {
+    setMenu(undefined);
+    setBusyError(undefined);
+    try {
+      setState(await window.grok.deleteArchivedSessions(ids));
+      setArchiveSelected(new Set());
+      if (!ids?.length) setArchiveSelecting(false);
+    } catch (err) {
+      setBusyError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function copyText(text: string) {
     setMenu(undefined);
     await window.grok.copyText(text);
@@ -1099,26 +1342,19 @@ export function App() {
   async function send() {
     const text = draft.trim();
     if (!text || state.busy) return;
+    followOutput.current = true;
     setDraft("");
     setBusyError(undefined);
     try {
       if (!state.sessionId) {
-        let workspace = draftWorkspace.trim();
-        if (!workspace) {
-          const folder = await window.grok.pickFolder();
-          if (!folder) {
-            setDraft(text);
-            return;
-          }
-          workspace = folder;
-          setDraftWorkspace(folder);
-        }
-        await window.grok.start(workspace, {
+        const workspace = draftWorkspace.trim();
+        const snap = await window.grok.start(workspace, {
           workspace,
           mode: state.sessionMode,
           modelId: state.modelId || undefined,
           effort: state.effort || undefined,
         });
+        setDraftWorkspace(snap.workspace ?? workspace);
       }
       setState(await window.grok.send(text));
     } catch (err) {
@@ -1192,12 +1428,14 @@ export function App() {
     () => sortSessions(
       state.sessions.filter((session) => session.archived),
       state.sessionSort,
+      false,
+      state.sessionOrder?.__archived__,
     ),
-    [state.sessions, state.sessionSort],
+    [state.sessions, state.sessionSort, state.sessionOrder],
   );
   const allLiveGroups = useMemo(
-    () => buildGroups(liveSessions, state.groupSort, state.sessionSort),
-    [liveSessions, state.groupSort, state.sessionSort],
+    () => buildGroups(liveSessions, state.groupSort, state.sessionSort, state.groupOrder ?? [], state.sessionOrder ?? {}),
+    [liveSessions, state.groupSort, state.sessionSort, state.groupOrder, state.sessionOrder],
   );
   const hiddenKeySet = useMemo(() => new Set(state.hiddenGroups), [state.hiddenGroups]);
   const liveGroups = useMemo(
@@ -1213,6 +1451,22 @@ export function App() {
     label: "已归档",
     sessions: archivedSessions,
   };
+  const archiveAllSelected =
+    archivedSessions.length > 0 && archivedSessions.every((session) => archiveSelected.has(session.sessionId));
+
+  useEffect(() => {
+    const ids = new Set(archivedSessions.map((session) => session.sessionId));
+    setArchiveSelected((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (ids.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+    if (ids.size === 0 && archiveSelecting) setArchiveSelecting(false);
+  }, [archivedSessions, archiveSelecting]);
   const menuSession =
     menu?.kind === "session" ? state.sessions.find((session) => session.sessionId === menu.id) : undefined;
   const menuGroup =
@@ -1225,6 +1479,89 @@ export function App() {
   const currentSession = state.sessions.find((session) => session.sessionId === state.sessionId);
   const archivedCollapsed = state.collapsedGroups.includes("__archived__");
   const hiddenCollapsed = state.collapsedGroups.includes("__hidden__");
+  const workspaceGroups = liveGroups.filter((group) => group.key !== "__pinned__");
+
+  function parseDrag(event: DragEvent): SidebarDragState | undefined {
+    try {
+      const raw = event.dataTransfer.getData(DRAG_MIME) || event.dataTransfer.getData("text/plain");
+      if (!raw) return sidebarDragRef.current;
+      const parsed = JSON.parse(raw) as SidebarDrag;
+      if (parsed?.kind === "group" && parsed.key) return parsed;
+      if (parsed?.kind === "session" && parsed.id && parsed.groupKey) return parsed;
+    } catch {
+      /* ignore */
+    }
+    return sidebarDragRef.current;
+  }
+
+  function beginGroupDrag(event: DragEvent, key: string) {
+    const payload: SidebarDrag = { kind: "group", key };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(DRAG_MIME, JSON.stringify(payload));
+    event.dataTransfer.setData("text/plain", JSON.stringify(payload));
+    skipGroupClick.current = true;
+    sidebarDragRef.current = payload;
+    setSidebarDrag(payload);
+  }
+
+  function beginSessionDrag(event: DragEvent, sessionId: string, groupKey: string) {
+    const payload: SidebarDrag = { kind: "session", id: sessionId, groupKey };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(DRAG_MIME, JSON.stringify(payload));
+    event.dataTransfer.setData("text/plain", JSON.stringify(payload));
+    sidebarDragRef.current = payload;
+    setSidebarDrag(payload);
+  }
+
+  function hoverDrop(event: DragEvent<HTMLElement>, kind: "group" | "session", overId: string, groupKey?: string) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const dragging = sidebarDragRef.current ?? parseDrag(event);
+    if (!dragging || dragging.kind !== kind) return;
+    if (kind === "session" && dragging.kind === "session" && dragging.groupKey !== groupKey) return;
+    const edge = dropEdge(event, event.currentTarget);
+    setSidebarDrag((current) => {
+      const next = current ?? dragging;
+      if (next.overId === overId && next.edge === edge) return current;
+      return { ...next, overId, edge };
+    });
+  }
+
+  function dropGroup(event: DragEvent<HTMLElement>, toKey: string) {
+    event.preventDefault();
+    const dragging = parseDrag(event);
+    const edge = sidebarDrag?.edge ?? dropEdge(event, event.currentTarget);
+    setSidebarDrag(undefined);
+    if (!dragging || dragging.kind !== "group" || dragging.key === toKey) return;
+    const visual = workspaceGroups.map((group) => group.key);
+    const next = moveKey(mergeOrder(visual, state.groupOrder ?? []), dragging.key, toKey, edge);
+    void window.grok.reorderGroups(next).then(setState);
+  }
+
+  function dropSession(event: DragEvent<HTMLElement>, toId: string, groupKey: string, sessions: SessionSummary[]) {
+    event.preventDefault();
+    const dragging = parseDrag(event);
+    const edge = sidebarDrag?.edge ?? dropEdge(event, event.currentTarget);
+    setSidebarDrag(undefined);
+    if (!dragging || dragging.kind !== "session" || dragging.groupKey !== groupKey || dragging.id === toId) return;
+    const visual = sessions.map((session) => session.sessionId);
+    const next = moveKey(mergeOrder(visual, state.sessionOrder?.[groupKey] ?? []), dragging.id, toId, edge);
+    void window.grok.reorderSessions(groupKey, next).then(setState);
+  }
+
+  function sessionDragProps(session: SessionSummary, groupKey: string, sessions: SessionSummary[]) {
+    return {
+      dragging: sidebarDrag?.kind === "session" && sidebarDrag.id === session.sessionId,
+      dropEdge: sidebarDrag?.kind === "session" && sidebarDrag.overId === session.sessionId ? sidebarDrag.edge : undefined,
+      onDragStart: (event: DragEvent<HTMLDivElement>) => beginSessionDrag(event, session.sessionId, groupKey),
+      onDragOver: (event: DragEvent<HTMLDivElement>) => hoverDrop(event, "session", session.sessionId, groupKey),
+      onDrop: (event: DragEvent<HTMLDivElement>) => dropSession(event, session.sessionId, groupKey, sessions),
+      onDragEnd: () => {
+        sidebarDragRef.current = undefined;
+        setSidebarDrag(undefined);
+      },
+    };
+  }
   const sessionMenuItems: MenuEntry[] = menuSession
     ? [
         {
@@ -1318,6 +1655,52 @@ export function App() {
             void window.grok.toggleGroup(menuGroup.key).then(setState);
           },
         },
+        ...(menuGroup.key === "__archived__"
+          ? [
+              {
+                type: "item" as const,
+                id: "select",
+                label: archiveSelecting ? "完成选择" : "选择会话",
+                onClick: () => {
+                  if (archiveSelecting) exitArchiveSelect();
+                  else void beginArchiveSelect();
+                },
+              },
+              {
+                type: "item" as const,
+                id: "select-all",
+                label: archiveAllSelected ? "取消全选" : "全选",
+                onClick: () => {
+                  setMenu(undefined);
+                  setArchiveSelecting(true);
+                  setArchiveSelected(
+                    archiveAllSelected
+                      ? new Set()
+                      : new Set(archivedSessions.map((session) => session.sessionId)),
+                  );
+                  if (state.collapsedGroups.includes("__archived__")) {
+                    void window.grok.toggleGroup("__archived__").then(setState);
+                  }
+                },
+              },
+              { type: "sep" as const, id: "sep-archive-del" },
+              {
+                type: "item" as const,
+                id: "delete-selected",
+                label: archiveSelected.size ? `删除已选（${archiveSelected.size}）` : "删除已选",
+                danger: true,
+                disabled: archiveSelected.size === 0,
+                onClick: () => void deleteArchivedSessions([...archiveSelected]),
+              },
+              {
+                type: "item" as const,
+                id: "delete-all-archived",
+                label: "删除全部会话",
+                danger: true,
+                onClick: () => void deleteArchivedSessions(),
+              },
+            ]
+          : []),
         ...(menuGroup.cwd
           ? [
               {
@@ -1357,6 +1740,11 @@ export function App() {
       checked: state.groupSort === option.id,
       onClick: () => {
         setMenu(undefined);
+        if (option.id === "custom") {
+          const keys = workspaceGroups.map((group) => group.key);
+          void window.grok.reorderGroups(mergeOrder(keys, state.groupOrder ?? [])).then(setState);
+          return;
+        }
         void window.grok.setSidebarSort(option.id, state.sessionSort).then(setState);
       },
     })),
@@ -1369,6 +1757,13 @@ export function App() {
       checked: state.sessionSort === option.id,
       onClick: () => {
         setMenu(undefined);
+        if (option.id === "custom") {
+          const order: Record<string, string[]> = {};
+          for (const group of liveGroups) order[group.key] = group.sessions.map((session) => session.sessionId);
+          if (archivedSessions.length) order.__archived__ = archivedSessions.map((session) => session.sessionId);
+          void window.grok.reorderSessionsBulk(order).then(setState);
+          return;
+        }
         void window.grok.setSidebarSort(state.groupSort, option.id).then(setState);
       },
     })),
@@ -1490,24 +1885,55 @@ export function App() {
               return (
                 <section className={`session-group ${group.key === "__pinned__" ? "pinned" : ""}`} key={group.key}>
                   <header
-                    className={`session-group-head ${menu?.kind === "group" && menu.id === group.key ? "menu-open" : ""}`}
+                    className={`session-group-head ${menu?.kind === "group" && menu.id === group.key ? "menu-open" : ""} ${sidebarDrag?.kind === "group" && sidebarDrag.key === group.key ? "dragging" : ""} ${sidebarDrag?.kind === "group" && sidebarDrag.overId === group.key ? `drop-${sidebarDrag.edge}` : ""}`}
+                    draggable={Boolean(group.cwd)}
                     onMouseEnter={(event) => showGroupHover(event, group)}
                     onMouseLeave={hideGroupHover}
                     onContextMenu={(event) => placeMenu(event, { kind: "group", id: group.key })}
+                    onDragStart={(event) => {
+                      if (!group.cwd) {
+                        event.preventDefault();
+                        return;
+                      }
+                      beginGroupDrag(event, group.key);
+                    }}
+                    onDragOver={(event) => {
+                      if (group.cwd) hoverDrop(event, "group", group.key);
+                    }}
+                    onDrop={(event) => {
+                      if (group.cwd) dropGroup(event, group.key);
+                    }}
+                    onDragEnd={() => {
+                      sidebarDragRef.current = undefined;
+                      setSidebarDrag(undefined);
+                    }}
                   >
-                    <button
+                    <div
                       className="session-group-toggle"
-                      type="button"
-                      onClick={() => void window.grok.toggleGroup(group.key).then(setState)}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        if (skipGroupClick.current) {
+                          skipGroupClick.current = false;
+                          return;
+                        }
+                        void window.grok.toggleGroup(group.key).then(setState);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          void window.grok.toggleGroup(group.key).then(setState);
+                        }
+                      }}
                     >
                       <FoldChevron open={!isCollapsed} />
                       <span className="session-group-copy">
                         <strong>{group.label}</strong>
                       </span>
                       <span className="session-count">{group.sessions.length}</span>
-                    </button>
+                    </div>
                     {group.cwd && (
-                      <button className="btn tiny" type="button" title="在此目录新建会话" onClick={() => void startIn(group.cwd!)}>
+                      <button className="btn tiny" type="button" title="在此目录新建会话" draggable={false} onClick={() => void startIn(group.cwd!)}>
                         +
                       </button>
                     )}
@@ -1516,6 +1942,7 @@ export function App() {
                         className="kebab"
                         type="button"
                         title="工作区操作"
+                        draggable={false}
                         onClick={(event) => placeMenu(event, { kind: "group", id: group.key })}
                       >
                         ⋯
@@ -1571,6 +1998,7 @@ export function App() {
                                     onStartRename={() => setRenamingId(session.sessionId)}
                                     onRename={(title) => void renameSession(session, title)}
                                     onCancelRename={() => setRenamingId(undefined)}
+                                    {...sessionDragProps(session, child.key, child.sessions)}
                                   />
                                 ))}
                               </Fold>
@@ -1591,6 +2019,7 @@ export function App() {
                             onStartRename={() => setRenamingId(session.sessionId)}
                             onRename={(title) => void renameSession(session, title)}
                             onCancelRename={() => setRenamingId(undefined)}
+                            {...sessionDragProps(session, group.key, group.sessions)}
                           />
                         ))}
                   </Fold>
@@ -1643,9 +2072,9 @@ export function App() {
               </section>
             )}
             {archivedSessions.length > 0 && (
-              <section className="session-group archived">
+              <section className={`session-group archived ${archiveSelecting ? "selecting" : ""}`}>
                 <header
-                  className="session-group-head"
+                  className={`session-group-head ${menu?.kind === "group" && menu.id === "__archived__" ? "menu-open" : ""}`}
                   onMouseEnter={(event) => showGroupHover(event, archivedGroup)}
                   onMouseLeave={hideGroupHover}
                   onContextMenu={(event) => placeMenu(event, { kind: "group", id: "__archived__" })}
@@ -1659,9 +2088,69 @@ export function App() {
                     <span className="session-group-copy">
                       <strong>已归档</strong>
                     </span>
-                    <span className="session-count">{archivedSessions.length}</span>
+                    <span className="session-count">
+                      {archiveSelecting
+                        ? `${archiveSelected.size}/${archivedSessions.length}`
+                        : archivedSessions.length}
+                    </span>
                   </button>
+                  {archiveSelecting ? (
+                    <button className="text-action" type="button" title="完成选择" onClick={exitArchiveSelect}>
+                      完成
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        className="text-action"
+                        type="button"
+                        title="选择会话"
+                        onClick={() => void beginArchiveSelect()}
+                      >
+                        选择
+                      </button>
+                      <button
+                        className="kebab"
+                        type="button"
+                        title="归档操作"
+                        onClick={(event) => placeMenu(event, { kind: "group", id: "__archived__" })}
+                      >
+                        ⋯
+                      </button>
+                    </>
+                  )}
                 </header>
+                {archiveSelecting ? (
+                  <div className="archive-select-bar">
+                    <button
+                      className="text-action"
+                      type="button"
+                      onClick={() =>
+                        setArchiveSelected(
+                          archiveAllSelected
+                            ? new Set()
+                            : new Set(archivedSessions.map((session) => session.sessionId)),
+                        )
+                      }
+                    >
+                      {archiveAllSelected ? "取消全选" : "全选"}
+                    </button>
+                    <button
+                      className="text-action danger"
+                      type="button"
+                      disabled={archiveSelected.size === 0}
+                      onClick={() => void deleteArchivedSessions([...archiveSelected])}
+                    >
+                      删除已选
+                    </button>
+                    <button
+                      className="text-action danger"
+                      type="button"
+                      onClick={() => void deleteArchivedSessions()}
+                    >
+                      全部删除
+                    </button>
+                  </div>
+                ) : null}
                 <Fold collapsed={archivedCollapsed}>
                   {archivedSessions.map((session) => (
                     <SessionRow
@@ -1671,12 +2160,16 @@ export function App() {
                       busy={state.busy && session.sessionId === state.sessionId}
                       menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
                       renaming={renamingId === session.sessionId}
+                      selecting={archiveSelecting}
+                      selected={archiveSelected.has(session.sessionId)}
                       onOpen={() => void openSession(session)}
                       onPin={(event) => void pinSession(event, session)}
                       onMenu={(event) => placeMenu(event, { kind: "session", id: session.sessionId })}
                       onStartRename={() => setRenamingId(session.sessionId)}
                       onRename={(title) => void renameSession(session, title)}
                       onCancelRename={() => setRenamingId(undefined)}
+                      onToggleSelect={() => toggleArchiveSelected(session.sessionId)}
+                      {...(archiveSelecting ? {} : sessionDragProps(session, "__archived__", archivedSessions))}
                     />
                   ))}
                 </Fold>
@@ -1807,9 +2300,6 @@ export function App() {
             ) : null}
           </div>
           <div className="topbar-actions">
-            {state.busy && (
-              <ComposerSubmit busy disabled={false} onClick={() => void window.grok.cancel()} />
-            )}
             {currentSession && (
               <button
                 className="icon-btn"
@@ -1882,14 +2372,15 @@ export function App() {
             <div
               className="transcript"
               ref={scroller}
-              onWheel={
-                state.settings.invertScroll
-                  ? (event) => {
-                      event.currentTarget.scrollTop -= event.deltaY;
-                      event.preventDefault();
-                    }
-                  : undefined
-              }
+              onWheel={(event) => {
+                const node = event.currentTarget;
+                if (state.settings.invertScroll) {
+                  node.scrollTop -= event.deltaY;
+                  event.preventDefault();
+                }
+                const goingUp = state.settings.invertScroll ? event.deltaY > 0 : event.deltaY < 0;
+                if (goingUp) followOutput.current = false;
+              }}
             >
               <div className="thread">
                 {currentSession?.interrupted ? (
@@ -2039,7 +2530,23 @@ function sessionTitle(session: SessionSummary): string {
   return session.title?.trim() || "未命名对话";
 }
 
-function sortSessions(sessions: SessionSummary[], sort: SessionSort, pinFirst = false): SessionSummary[] {
+function sortSessions(
+  sessions: SessionSummary[],
+  sort: SessionSort,
+  pinFirst = false,
+  customOrder?: string[],
+): SessionSummary[] {
+  if (sort === "custom") {
+    const rank = new Map((customOrder ?? []).map((id, index) => [id, index]));
+    return [...sessions].sort((a, b) => {
+      const ia = rank.get(a.sessionId);
+      const ib = rank.get(b.sessionId);
+      if (ia == null && ib == null) return (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0);
+      if (ia == null) return -1;
+      if (ib == null) return 1;
+      return ia - ib;
+    });
+  }
   return [...sessions].sort((a, b) => {
     if (pinFirst && sort === "recent") {
       const pinDelta = (b.pinOrder ?? 0) - (a.pinOrder ?? 0);
@@ -2055,7 +2562,18 @@ function groupLatest(group: SessionGroup): number {
   return Math.max(0, ...group.sessions.map((session) => session.updatedAtMs ?? 0));
 }
 
-function sortGroups(groups: SessionGroup[], sort: GroupSort): SessionGroup[] {
+function sortGroups(groups: SessionGroup[], sort: GroupSort, customOrder?: string[]): SessionGroup[] {
+  if (sort === "custom") {
+    const rank = new Map((customOrder ?? []).map((key, index) => [key, index]));
+    return [...groups].sort((a, b) => {
+      const ia = rank.get(a.key);
+      const ib = rank.get(b.key);
+      if (ia == null && ib == null) return groupLatest(b) - groupLatest(a);
+      if (ia == null) return 1;
+      if (ib == null) return -1;
+      return ia - ib;
+    });
+  }
   return [...groups].sort((a, b) => {
     if (sort === "name-asc") return a.label.localeCompare(b.label, "zh-CN", { numeric: true });
     if (sort === "name-desc") return b.label.localeCompare(a.label, "zh-CN", { numeric: true });
@@ -2072,6 +2590,8 @@ function groupsByCwd(
   sessions: SessionSummary[],
   sort: SessionSort,
   groupSort: GroupSort,
+  groupOrder: string[] = [],
+  sessionOrder: Record<string, string[]> = {},
   keyPrefix = "",
   pinFirst = false,
 ): SessionGroup[] {
@@ -2087,12 +2607,18 @@ function groupsByCwd(
     key,
     label: folderLabel(rows[0]?.cwd?.trim() || key),
     cwd: key === "(unknown)" || key.startsWith("__") ? undefined : rows[0]?.cwd?.trim() || key,
-    sessions: sortSessions(rows, sort, pinFirst),
+    sessions: sortSessions(rows, sort, pinFirst, sessionOrder?.[key]),
   }));
-  return sortGroups(rest, groupSort);
+  return sortGroups(rest, groupSort, groupOrder);
 }
 
-function buildGroups(sessions: SessionSummary[], groupSort: GroupSort, sessionSort: SessionSort): SessionGroup[] {
+function buildGroups(
+  sessions: SessionSummary[],
+  groupSort: GroupSort,
+  sessionSort: SessionSort,
+  groupOrder: string[] = [],
+  sessionOrder: Record<string, string[]> = {},
+): SessionGroup[] {
   const pinned = sessions.filter((session) => session.pinned);
   const unpinned = sessions.filter((session) => !session.pinned);
   const groups: SessionGroup[] = [];
@@ -2100,10 +2626,10 @@ function buildGroups(sessions: SessionSummary[], groupSort: GroupSort, sessionSo
     groups.push({
       key: "__pinned__",
       label: "置顶",
-      sessions: sortSessions(pinned, sessionSort, true),
+      sessions: sortSessions(pinned, sessionSort, true, sessionOrder?.__pinned__),
     });
   }
-  return [...groups, ...groupsByCwd(unpinned, sessionSort, groupSort)];
+  return [...groups, ...groupsByCwd(unpinned, sessionSort, groupSort, groupOrder, sessionOrder)];
 }
 
 function folderLabel(cwd: string): string {

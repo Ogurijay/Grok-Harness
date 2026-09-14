@@ -107,6 +107,15 @@ export function grokHome(): string {
   return process.env.GROK_HOME?.trim() || join(homedir(), ".grok");
 }
 
+export function defaultWorkspace(): string {
+  return homedir();
+}
+
+export function resolveWorkspace(folder?: string | null): string {
+  const next = folder?.trim();
+  return next || defaultWorkspace();
+}
+
 export function grokConfigPath(): string {
   return join(grokHome(), "config.toml");
 }

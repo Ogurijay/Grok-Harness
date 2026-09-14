@@ -6,6 +6,28 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.2.0 — 2026-09-14
+
+### 中文
+
+- 侧栏工作区和会话可拖拽改顺序；排序增加「自定义排列」，并记住。
+- 思考和操作在内容到达前显示动态 `...` 占位对话框，开始流出后移除。
+- 生成时不再锁死滚动：贴底才跟随最新输出，向上翻可自由看上文，减少窗口抖动。
+- 已归档分组可多选或全部删除会话，删除前确认。
+- 未选工作区时不再弹出目录框，默认用用户主目录。
+- 发送 / 停止按钮只留在对话输入区，顶栏不再放停止按钮。
+
+### English
+
+- Drag to reorder sidebar workspaces and sessions; sort includes Custom and persists.
+- Thinking and tool steps show an animated `...` placeholder until content streams in, then it is removed.
+- Generation no longer locks the transcript: follow the live output only while pinned to the bottom; scrolling up stays put and the window shakes less.
+- The Archived group can bulk-delete selected or all sessions, with a confirmation dialog.
+- Starting a chat without a workspace no longer opens a folder picker; the user home directory is used.
+- Send / Stop live only in the composer; the top bar no longer shows a stop button.
+
+---
+
 ## 0.1.1 — 2026-09-11
 
 ### 中文

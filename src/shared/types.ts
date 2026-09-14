@@ -117,11 +117,11 @@ export type AccountInfo = {
 
 export type SessionMode = "ask" | "auto" | "yolo" | "plan";
 
-export type GroupSort = "recent" | "name-asc" | "name-desc" | "count";
-export type SessionSort = "recent" | "title-asc" | "title-desc";
+export type GroupSort = "recent" | "name-asc" | "name-desc" | "count" | "custom";
+export type SessionSort = "recent" | "title-asc" | "title-desc" | "custom";
 
-const GROUP_SORTS: GroupSort[] = ["recent", "name-asc", "name-desc", "count"];
-const SESSION_SORTS: SessionSort[] = ["recent", "title-asc", "title-desc"];
+const GROUP_SORTS: GroupSort[] = ["recent", "name-asc", "name-desc", "count", "custom"];
+const SESSION_SORTS: SessionSort[] = ["recent", "title-asc", "title-desc", "custom"];
 
 export function parseGroupSort(value: unknown): GroupSort {
   return typeof value === "string" && (GROUP_SORTS as string[]).includes(value) ? (value as GroupSort) : "recent";
@@ -182,6 +182,8 @@ export type AppSnapshot = {
   hiddenGroups: string[];
   groupSort: GroupSort;
   sessionSort: SessionSort;
+  groupOrder: string[];
+  sessionOrder: Record<string, string[]>;
   account: AccountInfo;
   commands: SlashCommand[];
   settings: GrokSettings;

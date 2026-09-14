@@ -205,6 +205,32 @@ app.whenReady().then(async () => {
     await host.deleteSession(String(sessionId));
     return host.getSnapshot();
   });
+  ipcMain.handle("grok:deleteArchivedSessions", async (_evt, sessionIds?: unknown) => {
+    const archived = host.getSnapshot().sessions.filter((session) => session.archived);
+    const allow = new Set(archived.map((session) => session.sessionId));
+    const explicit = Array.isArray(sessionIds);
+    const selected = explicit ? sessionIds.map(String).filter((id) => allow.has(id)) : [];
+    const requested = explicit ? selected : [...allow];
+    const count = requested.length;
+    if (!count) return host.getSnapshot();
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options: Electron.MessageBoxOptions = {
+      type: "warning",
+      buttons: ["删除", "取消"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "删除已归档会话",
+      message: explicit
+        ? `永久删除已选的 ${count} 个已归档会话？`
+        : `永久删除全部 ${count} 个已归档会话？`,
+      detail: "会从 grok 历史中删除，无法恢复。",
+    };
+    const result = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options);
+    if (result.response !== 0) return host.getSnapshot();
+    await host.deleteArchivedSessions(requested);
+    return host.getSnapshot();
+  });
   ipcMain.handle("grok:setSidebarCollapsed", (_evt, collapsed: boolean) => {
     host.setSidebarCollapsed(Boolean(collapsed));
     return host.getSnapshot();
@@ -251,6 +277,18 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("grok:setSidebarSort", (_evt, groupSort?: unknown, sessionSort?: unknown) => {
     host.setSidebarSort(groupSort as GroupSort | undefined, sessionSort as SessionSort | undefined);
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:reorderGroups", (_evt, keys: string[]) => {
+    host.reorderGroups(Array.isArray(keys) ? keys.map(String) : []);
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:reorderSessions", (_evt, groupKey: string, ids: string[]) => {
+    host.reorderSessions(String(groupKey ?? ""), Array.isArray(ids) ? ids.map(String) : []);
+    return host.getSnapshot();
+  });
+  ipcMain.handle("grok:reorderSessionsBulk", (_evt, order: Record<string, string[]>) => {
+    host.reorderSessionsBulk(order && typeof order === "object" ? order : {});
     return host.getSnapshot();
   });
   ipcMain.handle("grok:refreshAccount", async () => {
