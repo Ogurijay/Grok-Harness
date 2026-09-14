@@ -19,7 +19,7 @@ import type {
 } from "../shared/types";
 import { normalizeGroupKey } from "../shared/types";
 import { CodeView, prettyUnknown } from "./CodeView";
-import { formatDuration, formatElapsedClock, formatTokens } from "../shared/step-stats";
+import { formatDuration, formatElapsedClock, formatSessionElapsed, formatTokens } from "../shared/step-stats";
 import { GROK_SETTINGS_DEFAULTS } from "../shared/grok-settings";
 import { ModelEffortPicker } from "./ModelEffortPicker";
 import { SettingsPanel } from "./SettingsPanel";
@@ -844,22 +844,42 @@ function TimelineItemView({
   );
 }
 
+function toolHasDetail(item: Extract<TimelineItem, { kind: "tool" }>): boolean {
+  return Boolean((item.outputText && item.outputText.trim()) || item.diffs?.length);
+}
+
+function useLiveFold(live: boolean) {
+  const ref = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.open = live;
+  }, [live]);
+  return ref;
+}
+
 function ThoughtRow({ item }: { item: Extract<TimelineItem, { kind: "thought" }> }) {
   const live = Boolean(item.streaming);
+  const foldRef = useLiveFold(live);
+  const hasBody = live || !isBlank(item.text);
+  const row = (
+    <>
+      <span className={`op-fold ${hasBody ? "" : "empty"}`}>{hasBody ? <FoldChevron /> : null}</span>
+      <span className="op-glyph thought" aria-hidden="true">
+        ◆
+      </span>
+      <span className="op-copy">{thoughtLabel(item, live)}</span>
+    </>
+  );
+  if (!hasBody) {
+    return <div className={`op-row thought${item.interrupted ? " interrupted" : ""}`}>{row}</div>;
+  }
   return (
-    <div className={`op-item thought${item.interrupted ? " interrupted" : ""}${live ? " live" : ""}`}>
-      <div className="op-row thought">
-        <span className="op-glyph thought" aria-hidden="true">
-          ◆
-        </span>
-        <span className="op-copy">{thoughtLabel(item, live)}</span>
-      </div>
-      {live ? (
-        <div className="thought-inline">
-          {isBlank(item.text) ? <StreamingDots /> : item.text}
-        </div>
-      ) : null}
-    </div>
+    <details
+      ref={foldRef}
+      className={`op-item thought${item.interrupted ? " interrupted" : ""}${live ? " live" : ""}`}
+    >
+      <summary className="op-row thought">{row}</summary>
+      <div className="thought-inline">{isBlank(item.text) ? <StreamingDots /> : item.text}</div>
+    </details>
   );
 }
 
@@ -873,34 +893,61 @@ function ToolRow({
   onSelect: () => void;
 }) {
   const live = item.status === "pending" || item.status === "in_progress";
+  const foldRef = useLiveFold(live);
   const { role, text, added, removed } = toolLabel(item);
-  return (
-    <button
-      type="button"
-      className={`op-row ${role} ${live ? "live" : ""} ${item.status} ${active ? "active" : ""}`}
-      onClick={onSelect}
-    >
-      {role === "run" ? (
-        <span className={`op-bar ${live ? "live" : item.status}`} aria-hidden="true" />
-      ) : (
-        <span className={`op-glyph ${role}`} aria-hidden="true">
-          {role === "edit" ? ">" : role === "search" || role === "fetch" ? "◈" : role === "read" ? "·" : "•"}
-        </span>
-      )}
-      <span className="op-copy">
-        {toolTitlePending(item) ? <StreamingDots /> : text}
-        {added || removed ? (
-          <>
-            {" "}
-            <span className="op-diff">
-              {added ? <span className="op-add">+{added}</span> : null}
-              {added && removed ? "/" : null}
-              {removed ? <span className="op-del">-{removed}</span> : null}
-            </span>
-          </>
-        ) : null}
+  const hasBody = toolHasDetail(item);
+  const glyph =
+    role === "run" ? (
+      <span className={`op-bar ${live ? "live" : item.status}`} aria-hidden="true" />
+    ) : (
+      <span className={`op-glyph ${role}`} aria-hidden="true">
+        {role === "edit" ? ">" : role === "search" || role === "fetch" ? "◈" : role === "read" ? "·" : "•"}
       </span>
-    </button>
+    );
+  const copy = (
+    <span className="op-copy">
+      {toolTitlePending(item) ? <StreamingDots /> : text}
+      {added || removed ? (
+        <>
+          {" "}
+          <span className="op-diff">
+            {added ? <span className="op-add">+{added}</span> : null}
+            {added && removed ? "/" : null}
+            {removed ? <span className="op-del">-{removed}</span> : null}
+          </span>
+        </>
+      ) : null}
+    </span>
+  );
+  const rowClass = `op-row ${role} ${live ? "live" : ""} ${item.status} ${active ? "active" : ""}`;
+  const head = (
+    <>
+      <span className={`op-fold ${hasBody ? "" : "empty"}`}>{hasBody ? <FoldChevron /> : null}</span>
+      {glyph}
+      {copy}
+    </>
+  );
+  if (!hasBody) {
+    return (
+      <button type="button" className={rowClass} onClick={onSelect}>
+        {head}
+      </button>
+    );
+  }
+  return (
+    <details ref={foldRef} className={`op-item tool ${active ? "active" : ""}`}>
+      <summary className={rowClass} onClick={() => onSelect()}>
+        {head}
+      </summary>
+      <div className="op-detail">
+        {item.diffs?.map((diff) => (
+          <div className="op-detail-path" key={diff.path}>
+            {diff.path}
+          </div>
+        ))}
+        {item.outputText?.trim() ? <pre className="op-detail-out">{item.outputText}</pre> : null}
+      </div>
+    </details>
   );
 }
 
@@ -929,15 +976,18 @@ function ActivityStream({
         }
         if (item.kind === "plan") {
           return (
-            <div key={item.id} className="op-item plan">
-              <div className="op-row">
+            <details key={item.id} className="op-item plan">
+              <summary className="op-row">
+                <span className="op-fold">
+                  <FoldChevron />
+                </span>
                 <span className="op-glyph" aria-hidden="true">
                   ▸
                 </span>
                 <span className="op-copy">Plan</span>
-              </div>
+              </summary>
               <pre className="thought-inline">{item.text}</pre>
-            </div>
+            </details>
           );
         }
         return null;
@@ -3023,7 +3073,7 @@ export function App() {
                 {!state.busy && (state.runStats.durationMs || state.runStats.tokens) ? (
                   <div className="session-stats">
                     本会话
-                    {state.runStats.durationMs ? ` ${formatElapsedClock(state.runStats.durationMs)}` : ""}
+                    {state.runStats.durationMs ? ` ${formatSessionElapsed(state.runStats.durationMs)}` : ""}
                     {state.runStats.tokens ? ` · ${formatTokens(state.runStats.tokens)} tok` : ""}
                   </div>
                 ) : null}

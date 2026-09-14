@@ -1004,7 +1004,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.4.0" },
+        clientInfo: { name: "grok-harness", version: "0.4.1" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,

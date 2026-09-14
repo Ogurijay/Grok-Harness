@@ -1572,7 +1572,7 @@ details[open] > summary .chevron {
 .op-item { min-width: 0; }
 .op-row {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
+  grid-template-columns: 12px 14px minmax(0, 1fr);
   gap: 8px;
   align-items: start;
   width: 100%;
@@ -1585,10 +1585,28 @@ details[open] > summary .chevron {
   color: var(--text);
   line-height: 1.45;
 }
-button.op-row { cursor: pointer; }
-button.op-row:hover { background: var(--bg-hover); }
-button.op-row.active { background: var(--bg-active); }
+button.op-row,
+.op-item > summary.op-row { cursor: pointer; }
+.op-item > summary.op-row {
+  list-style: none;
+}
+.op-item > summary.op-row::-webkit-details-marker { display: none; }
+button.op-row:hover,
+.op-item > summary.op-row:hover { background: var(--bg-hover); }
+button.op-row.active,
+.op-item.active > summary.op-row,
+summary.op-row.active { background: var(--bg-active); }
 .op-row.thought { color: var(--muted); }
+.op-fold {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 1.45em;
+  color: var(--faint);
+}
+.op-fold.empty { visibility: hidden; }
+.op-fold .chevron { width: 10px; height: 10px; }
 .op-glyph {
   display: inline-flex;
   justify-content: center;
@@ -1620,11 +1638,27 @@ button.op-row.active { background: var(--bg-active); }
 }
 .op-add { color: var(--olive); }
 .op-del { color: var(--danger); }
-.thought-inline {
-  margin: 0 0 4px 22px;
+.thought-inline,
+.op-detail {
+  margin: 0 0 8px 34px;
   color: var(--muted);
   font-size: 13px;
   white-space: pre-wrap;
+}
+.op-detail-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--faint);
+  margin-bottom: 4px;
+}
+.op-detail-out {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  color: var(--muted);
 }
 .op-dot {
   width: 7px;

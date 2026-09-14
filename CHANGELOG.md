@@ -6,6 +6,20 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.4.1 — 2026-09-15
+
+### 中文
+
+- 会话总用时改为 `x天x时x分x秒`。
+- 思考默认收起；思考和操作都可以点开展开或折叠。
+
+### English
+
+- Session total duration uses `x天x时x分x秒`.
+- Thoughts stay collapsed by default; thinking and tool rows can expand and collapse.
+
+---
+
 ## 0.4.0 — 2026-09-14
 
 ### 中文
