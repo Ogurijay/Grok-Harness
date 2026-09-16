@@ -6,6 +6,18 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.4.2 — 2026-09-16
+
+### 中文
+
+- 输入不再带动整页重绘：长对话里打字不再明显卡顿。
+
+### English
+
+- Typing no longer re-renders the whole app, so the composer stays responsive in long chats.
+
+---
+
 ## 0.4.1 — 2026-09-15
 
 ### 中文

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,6 +8,7 @@ import type {
   BackgroundTask,
   GroupSort,
   MentionHit,
+  ModelInfo,
   PermissionRequest,
   PromptAttachment,
   SessionRef,
@@ -349,7 +350,7 @@ function ChatImage({
   );
 }
 
-function ChatMarkdown({
+const ChatMarkdown = memo(function ChatMarkdown({
   text,
   onOpenImage,
 }: {
@@ -385,7 +386,7 @@ function ChatMarkdown({
       {text}
     </Markdown>
   );
-}
+});
 
 function MessageExtras({
   attachments,
@@ -501,7 +502,8 @@ function sessionLive(session: SessionSummary, state: AppSnapshot): boolean {
   return Boolean(session.running) || (state.busy && session.sessionId === state.sessionId);
 }
 
-function TasksPane({ tasks, now }: { tasks: BackgroundTask[]; now: number }) {
+function TasksPane({ tasks }: { tasks: BackgroundTask[] }) {
+  const now = useNow(tasks.length > 0);
   if (!tasks.length) return null;
   return (
     <details className="tasks-pane" open>
@@ -521,6 +523,15 @@ function TasksPane({ tasks, now }: { tasks: BackgroundTask[]; now: number }) {
         ))}
       </ul>
     </details>
+  );
+}
+
+function TurnClock({ startedAt, title }: { startedAt?: number; title?: string }) {
+  const now = useNow(true);
+  return (
+    <span className="turn-clock" title={title}>
+      {formatElapsedClock(now - (startedAt ?? now))}
+    </span>
   );
 }
 
@@ -607,6 +618,320 @@ function ComposerSubmit({
     </button>
   );
 }
+
+type ComposerSubmitPayload = {
+  text: string;
+  attachments: PromptAttachment[];
+  sessionRefs: SessionRef[];
+  now?: boolean;
+};
+
+const ComposerPane = memo(function ComposerPane({
+  className,
+  busy,
+  commands,
+  models,
+  modelId,
+  effort,
+  placeholder,
+  rows,
+  extraToolbar,
+  onSend,
+  onStop,
+  onEmptyEnter,
+  onModelEffort,
+}: {
+  className?: string;
+  busy: boolean;
+  commands: SlashCommand[];
+  models: ModelInfo[];
+  modelId?: string;
+  effort?: string;
+  placeholder: string;
+  rows: number;
+  extraToolbar?: ReactNode;
+  onSend: (payload: ComposerSubmitPayload) => Promise<void>;
+  onStop: () => Promise<void>;
+  onEmptyEnter?: () => Promise<void>;
+  onModelEffort: (modelId: string, effort?: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
+  const [sessionRefs, setSessionRefs] = useState<SessionRef[]>([]);
+  const [mentionHits, setMentionHits] = useState<MentionHit[]>([]);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [dropping, setDropping] = useState(false);
+
+  const slashQuery = useMemo(() => {
+    const match = draft.match(/^\/([^\s]*)$/);
+    return match ? match[1].toLowerCase() : null;
+  }, [draft]);
+  const slashHits = useMemo(() => {
+    if (slashQuery == null) return [];
+    return commands.filter((command) => command.name.toLowerCase().includes(slashQuery)).slice(0, 14);
+  }, [slashQuery, commands]);
+  const mentionQuery = useMemo(() => {
+    if (slashQuery != null) return null;
+    const match = draft.match(/(^|\s)@([^\s]*)$/);
+    return match ? match[2] : null;
+  }, [draft, slashQuery]);
+
+  useEffect(() => {
+    setSlashIndex(0);
+  }, [slashQuery]);
+
+  useEffect(() => {
+    setMentionIndex(0);
+    if (mentionQuery == null) {
+      setMentionHits([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void window.grok.searchMentions(mentionQuery).then((hits) => {
+        if (!cancelled) setMentionHits(hits);
+      });
+    }, 80);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [mentionQuery]);
+
+  function mergeAttachments(rows: PromptAttachment[]) {
+    setAttachments((prev) => {
+      const seen = new Set(prev.map((item) => item.path));
+      const next = [...prev];
+      for (const row of rows) {
+        if (seen.has(row.path) || next.length >= 20) continue;
+        seen.add(row.path);
+        next.push(row);
+      }
+      return next;
+    });
+  }
+
+  async function addPaths(paths: string[]) {
+    if (!paths.length) return;
+    const rows = await window.grok.inspectPaths(paths);
+    if (rows.length) mergeAttachments(rows);
+  }
+
+  async function pickAttachments() {
+    const rows = await window.grok.pickFiles();
+    if (rows.length) mergeAttachments(rows);
+  }
+
+  async function pickMention(hit: MentionHit) {
+    setMentionHits([]);
+    setDraft((value) => value.replace(/(^|\s)@[^\s]*$/, "$1"));
+    if (hit.kind === "file" && hit.path) {
+      await addPaths([hit.path]);
+      return;
+    }
+    if (hit.kind === "session" && hit.sessionId) {
+      const ref: SessionRef = { sessionId: hit.sessionId, title: hit.label, cwd: hit.cwd };
+      setSessionRefs((prev) => (prev.some((item) => item.sessionId === ref.sessionId) ? prev : [...prev, ref].slice(0, 5)));
+    }
+  }
+
+  async function onComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const fileList = event.clipboardData?.files;
+    const paths: string[] = [];
+    if (fileList?.length) {
+      for (const file of fileList) {
+        const path = (file as File & { path?: string }).path;
+        if (path) paths.push(path);
+      }
+    }
+    if (paths.length) {
+      event.preventDefault();
+      await addPaths(paths);
+      return;
+    }
+    const items = event.clipboardData?.items;
+    const hasImage = items ? [...items].some((item) => item.type.startsWith("image/")) : false;
+    if (!hasImage) return;
+    event.preventDefault();
+    const shot = await window.grok.saveClipboardImage();
+    if (shot) mergeAttachments([shot]);
+  }
+
+  function onComposerDragOver(event: DragEvent<HTMLDivElement>) {
+    if (![...event.dataTransfer.types].includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDropping(true);
+  }
+
+  async function onComposerDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDropping(false);
+    const paths = [...event.dataTransfer.files]
+      .map((file) => (file as File & { path?: string }).path)
+      .filter((path): path is string => Boolean(path));
+    await addPaths(paths);
+  }
+
+  function completeSlash(name: string) {
+    const command = commands.find((item) => item.name === name);
+    setDraft(command?.hint ? `/${name} ` : `/${name}`);
+  }
+
+  function insertComposerNewline(event: KeyboardEvent<HTMLTextAreaElement>) {
+    event.preventDefault();
+    const el = event.currentTarget;
+    const start = el.selectionStart ?? draft.length;
+    const end = el.selectionEnd ?? draft.length;
+    const next = `${draft.slice(0, start)}\n${draft.slice(end)}`;
+    setDraft(next);
+    requestAnimationFrame(() => {
+      el.selectionStart = el.selectionEnd = start + 1;
+    });
+  }
+
+  const emptyComposer = !draft.trim() && !attachments.length && !sessionRefs.length;
+
+  async function submit(now = false) {
+    if (busy && !now && emptyComposer) {
+      await onEmptyEnter?.();
+      return;
+    }
+    if (emptyComposer) return;
+    const pendingFiles = attachments;
+    const pendingRefs = sessionRefs;
+    const text = draft.trim();
+    setDraft("");
+    setAttachments([]);
+    setSessionRefs([]);
+    setMentionHits([]);
+    try {
+      await onSend({ text, attachments: pendingFiles, sessionRefs: pendingRefs, now });
+    } catch {
+      setDraft(text);
+      setAttachments(pendingFiles);
+      setSessionRefs(pendingRefs);
+    }
+  }
+
+  async function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const newline = event.key === "Enter" && (event.ctrlKey || event.metaKey);
+    const plainEnter = event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+    if (newline) {
+      insertComposerNewline(event);
+      return;
+    }
+    if (mentionHits.length > 0 && mentionQuery != null) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMentionIndex((index) => (index + 1) % mentionHits.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMentionIndex((index) => (index - 1 + mentionHits.length) % mentionHits.length);
+        return;
+      }
+      if (event.key === "Tab" || plainEnter) {
+        event.preventDefault();
+        const hit = mentionHits[mentionIndex] ?? mentionHits[0];
+        if (hit) await pickMention(hit);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMentionHits([]);
+        return;
+      }
+    }
+    if (slashHits.length > 0 && slashQuery != null) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashIndex((index) => (index + 1) % slashHits.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashIndex((index) => (index - 1 + slashHits.length) % slashHits.length);
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        completeSlash(slashHits[slashIndex]?.name ?? slashHits[0].name);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDraft("");
+        return;
+      }
+      if (plainEnter) {
+        event.preventDefault();
+        const hit = slashHits[slashIndex] ?? slashHits[0];
+        const typed = draft.slice(1);
+        if (typed === hit.name || typed.startsWith(`${hit.name} `)) {
+          await submit();
+          return;
+        }
+        completeSlash(hit.name);
+        return;
+      }
+    }
+    if (plainEnter) {
+      event.preventDefault();
+      await submit();
+    }
+  }
+
+  return (
+    <div
+      className={`composer ${className ?? ""} ${dropping ? "dropping" : ""}`}
+      onDragOver={onComposerDragOver}
+      onDragLeave={() => setDropping(false)}
+      onDrop={(event) => void onComposerDrop(event)}
+    >
+      {slashHits.length > 0 && (
+        <SlashMenu commands={slashHits} activeIndex={slashIndex} onPick={completeSlash} />
+      )}
+      {mentionHits.length > 0 && (
+        <MentionMenu hits={mentionHits} activeIndex={mentionIndex} onPick={(hit) => void pickMention(hit)} />
+      )}
+      <ComposerChips
+        attachments={attachments}
+        sessionRefs={sessionRefs}
+        onRemoveAttachment={(id) => setAttachments((prev) => prev.filter((item) => item.id !== id))}
+        onRemoveSession={(sessionId) => setSessionRefs((prev) => prev.filter((item) => item.sessionId !== sessionId))}
+      />
+      <textarea
+        value={draft}
+        placeholder={placeholder}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => void onComposerKey(event)}
+        onPaste={(event) => void onComposerPaste(event)}
+        rows={rows}
+      />
+      <div className="composer-toolbar">
+        <button className="icon-btn attach-btn" type="button" title="添加文件或图片" onClick={() => void pickAttachments()}>
+          <AttachIcon />
+        </button>
+        {extraToolbar}
+        <ModelEffortPicker
+          models={models}
+          modelId={modelId}
+          effort={effort}
+          disabled={busy}
+          onChange={onModelEffort}
+        />
+        <ComposerSubmit
+          busy={busy && emptyComposer}
+          disabled={emptyComposer && !busy}
+          onClick={() => void (busy && emptyComposer ? onStop() : submit())}
+        />
+      </div>
+    </div>
+  );
+});
 
 function Stamp({ at, show = true }: { at?: number; show?: boolean }) {
   if (!show || !at) return null;
@@ -996,7 +1321,7 @@ function ActivityStream({
   );
 }
 
-function TimelineView({
+const TimelineView = memo(function TimelineView({
   items,
   busy,
   selectedId,
@@ -1054,7 +1379,7 @@ function TimelineView({
       {waiting ? <StreamPlaceholder label={waitingLabel} /> : null}
     </>
   );
-}
+});
 
 function Inspector({
   item,
@@ -1453,30 +1778,22 @@ function HoverCard({
 
 export function App() {
   const [state, setState] = useState<AppSnapshot>(empty);
-  const [draft, setDraft] = useState("");
   const [selectedToolId, setSelectedToolId] = useState<string | undefined>();
   const [busyError, setBusyError] = useState<string | undefined>();
   const [accountOpen, setAccountOpen] = useState(false);
   const accountDockRef = useRef<HTMLDivElement>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
-  const [slashIndex, setSlashIndex] = useState(0);
   const [menu, setMenu] = useState<AppMenu | undefined>();
   const [hover, setHover] = useState<{ group: SessionGroup; x: number; y: number } | undefined>();
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scroller = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
-  const now = useNow(Boolean(state.busy || state.backgroundTasks.length));
   const [draftWorkspace, setDraftWorkspace] = useState("");
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [renamingId, setRenamingId] = useState<string | undefined>();
   const [archiveSelecting, setArchiveSelecting] = useState(false);
   const [archiveSelected, setArchiveSelected] = useState<Set<string>>(() => new Set());
-  const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
-  const [sessionRefs, setSessionRefs] = useState<SessionRef[]>([]);
-  const [mentionHits, setMentionHits] = useState<MentionHit[]>([]);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const [dropping, setDropping] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
   const [lightbox, setLightbox] = useState<{ path: string; src: string; name?: string } | undefined>();
   const [sidebarDrag, setSidebarDrag] = useState<SidebarDragState | undefined>();
@@ -1485,41 +1802,6 @@ export function App() {
   const skipGroupClick = useRef(false);
   const inspectorWidthRef = useRef(320);
   const resizing = useRef(false);
-  const slashQuery = useMemo(() => {
-    const match = draft.match(/^\/([^\s]*)$/);
-    return match ? match[1].toLowerCase() : null;
-  }, [draft]);
-  const slashHits = useMemo(() => {
-    if (slashQuery == null) return [];
-    return state.commands.filter((command) => command.name.toLowerCase().includes(slashQuery)).slice(0, 14);
-  }, [slashQuery, state.commands]);
-  const mentionQuery = useMemo(() => {
-    if (slashQuery != null) return null;
-    const match = draft.match(/(^|\s)@([^\s]*)$/);
-    return match ? match[2] : null;
-  }, [draft, slashQuery]);
-
-  useEffect(() => {
-    setSlashIndex(0);
-  }, [slashQuery]);
-
-  useEffect(() => {
-    setMentionIndex(0);
-    if (mentionQuery == null) {
-      setMentionHits([]);
-      return;
-    }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void window.grok.searchMentions(mentionQuery).then((hits) => {
-        if (!cancelled) setMentionHits(hits);
-      });
-    }, 80);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [mentionQuery]);
 
   useEffect(() => {
     const unsub = window.grok.onEvent((event) => {
@@ -1805,228 +2087,56 @@ export function App() {
     if (!result.ok) setBusyError(result.error || "无法打开工作目录");
   }
 
-  function mergeAttachments(rows: PromptAttachment[]) {
-    setAttachments((prev) => {
-      const seen = new Set(prev.map((item) => item.path));
-      const next = [...prev];
-      for (const row of rows) {
-        if (seen.has(row.path) || next.length >= 20) continue;
-        seen.add(row.path);
-        next.push(row);
-      }
-      return next;
-    });
-  }
-
-  async function addPaths(paths: string[]) {
-    if (!paths.length) return;
-    const rows = await window.grok.inspectPaths(paths);
-    if (rows.length) mergeAttachments(rows);
-  }
-
-  async function openImage(path: string, preview?: string, name?: string) {
+  const openImage = useCallback(async (path: string, preview?: string, name?: string) => {
     const src = (await window.grok.imageDataUrl(path)) || preview || path;
     setLightbox({ path, src, name });
-  }
+  }, []);
 
-  async function pickAttachments() {
-    const rows = await window.grok.pickFiles();
-    if (rows.length) mergeAttachments(rows);
-  }
+  const selectTool = useCallback((item: Extract<TimelineItem, { kind: "tool" }>) => {
+    setSelectedToolId(item.id);
+    void window.grok.setInspectorOpen(true);
+  }, []);
 
-  function removeAttachment(id: string) {
-    setAttachments((prev) => prev.filter((item) => item.id !== id));
-  }
-
-  function removeSessionRef(sessionId: string) {
-    setSessionRefs((prev) => prev.filter((item) => item.sessionId !== sessionId));
-  }
-
-  function replaceAtQuery() {
-    setDraft((value) => value.replace(/(^|\s)@[^\s]*$/, "$1"));
-  }
-
-  async function pickMention(hit: MentionHit) {
-    setMentionHits([]);
-    replaceAtQuery();
-    if (hit.kind === "file" && hit.path) {
-      await addPaths([hit.path]);
-      return;
-    }
-    if (hit.kind === "session" && hit.sessionId) {
-      const ref: SessionRef = { sessionId: hit.sessionId, title: hit.label, cwd: hit.cwd };
-      setSessionRefs((prev) => (prev.some((item) => item.sessionId === ref.sessionId) ? prev : [...prev, ref].slice(0, 5)));
-    }
-  }
-
-  async function onComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const fileList = event.clipboardData?.files;
-    const paths: string[] = [];
-    if (fileList?.length) {
-      for (const file of fileList) {
-        const path = (file as File & { path?: string }).path;
-        if (path) paths.push(path);
-      }
-    }
-    if (paths.length) {
-      event.preventDefault();
-      await addPaths(paths);
-      return;
-    }
-    const items = event.clipboardData?.items;
-    const hasImage = items ? [...items].some((item) => item.type.startsWith("image/")) : false;
-    if (!hasImage) return;
-    event.preventDefault();
-    const shot = await window.grok.saveClipboardImage();
-    if (shot) mergeAttachments([shot]);
-  }
-
-  function onComposerDragOver(event: DragEvent<HTMLDivElement>) {
-    if (![...event.dataTransfer.types].includes("Files")) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-    setDropping(true);
-  }
-
-  async function onComposerDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setDropping(false);
-    const paths = [...event.dataTransfer.files]
-      .map((file) => (file as File & { path?: string }).path)
-      .filter((path): path is string => Boolean(path));
-    await addPaths(paths);
-  }
-
-  async function stopTurn() {
+  const stopTurn = useCallback(async () => {
     setBusyError(undefined);
     try {
       setState(await window.grok.cancel());
     } catch (err) {
       setBusyError(err instanceof Error ? err.message : String(err));
     }
-  }
+  }, []);
 
-  async function send(now = false) {
-    const text = draft.trim();
-    const hasPayload = Boolean(text || attachments.length || sessionRefs.length);
-    if (state.busy && !now && !hasPayload) {
-      if (state.promptQueue.length) setState(await window.grok.sendQueuedNow());
-      return;
-    }
-    if (!hasPayload) return;
-    followOutput.current = true;
-    const pendingFiles = attachments;
-    const pendingRefs = sessionRefs;
-    setDraft("");
-    setAttachments([]);
-    setSessionRefs([]);
-    setMentionHits([]);
-    setBusyError(undefined);
-    try {
-      if (!state.sessionId) {
-        const workspace = draftWorkspace.trim();
-        const snap = await window.grok.start(workspace, {
-          workspace,
-          mode: state.sessionMode,
-          modelId: state.modelId || undefined,
-          effort: state.effort || undefined,
-        });
-        setDraftWorkspace(snap.workspace ?? workspace);
-      }
-      setState(await window.grok.send(text, pendingFiles, pendingRefs, now));
-    } catch (err) {
-      setDraft(text);
-      setAttachments(pendingFiles);
-      setSessionRefs(pendingRefs);
-      setBusyError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  function completeSlash(name: string) {
-    const command = state.commands.find((item) => item.name === name);
-    setDraft(command?.hint ? `/${name} ` : `/${name}`);
-  }
-
-  function insertComposerNewline(event: KeyboardEvent<HTMLTextAreaElement>) {
-    event.preventDefault();
-    const el = event.currentTarget;
-    const start = el.selectionStart ?? draft.length;
-    const end = el.selectionEnd ?? draft.length;
-    const next = `${draft.slice(0, start)}\n${draft.slice(end)}`;
-    setDraft(next);
-    requestAnimationFrame(() => {
-      el.selectionStart = el.selectionEnd = start + 1;
-    });
-  }
-
-  async function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
-    const newline = event.key === "Enter" && (event.ctrlKey || event.metaKey);
-    const plainEnter = event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
-    if (newline) {
-      insertComposerNewline(event);
-      return;
-    }
-    if (mentionHits.length > 0 && mentionQuery != null) {
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setMentionIndex((index) => (index + 1) % mentionHits.length);
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setMentionIndex((index) => (index - 1 + mentionHits.length) % mentionHits.length);
-        return;
-      }
-      if (event.key === "Tab" || plainEnter) {
-        event.preventDefault();
-        const hit = mentionHits[mentionIndex] ?? mentionHits[0];
-        if (hit) await pickMention(hit);
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setMentionHits([]);
-        return;
-      }
-    }
-    if (slashHits.length > 0 && slashQuery != null) {
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setSlashIndex((index) => (index + 1) % slashHits.length);
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setSlashIndex((index) => (index - 1 + slashHits.length) % slashHits.length);
-        return;
-      }
-      if (event.key === "Tab") {
-        event.preventDefault();
-        completeSlash(slashHits[slashIndex]?.name ?? slashHits[0].name);
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setDraft("");
-        return;
-      }
-      if (plainEnter) {
-        event.preventDefault();
-        const hit = slashHits[slashIndex] ?? slashHits[0];
-        const typed = draft.slice(1);
-        if (typed === hit.name || typed.startsWith(`${hit.name} `)) {
-          await send();
-          return;
+  const sendComposer = useCallback(
+    async ({ text, attachments, sessionRefs, now }: ComposerSubmitPayload) => {
+      followOutput.current = true;
+      setBusyError(undefined);
+      try {
+        if (!state.sessionId) {
+          const workspace = draftWorkspace.trim();
+          const snap = await window.grok.start(workspace, {
+            workspace,
+            mode: state.sessionMode,
+            modelId: state.modelId || undefined,
+            effort: state.effort || undefined,
+          });
+          setDraftWorkspace(snap.workspace ?? workspace);
         }
-        completeSlash(hit.name);
-        return;
+        setState(await window.grok.send(text, attachments, sessionRefs, now));
+      } catch (err) {
+        setBusyError(err instanceof Error ? err.message : String(err));
+        throw err;
       }
-    }
-    if (plainEnter) {
-      event.preventDefault();
-      await send();
-    }
-  }
+    },
+    [state.sessionId, state.sessionMode, state.modelId, state.effort, draftWorkspace],
+  );
+
+  const sendQueuedNow = useCallback(async () => {
+    if (state.promptQueue.length) setState(await window.grok.sendQueuedNow());
+  }, [state.promptQueue.length]);
+
+  const setModelEffort = useCallback((modelId: string, effort?: string) => {
+    void window.grok.setModelEffort(modelId, effort).then(setState);
+  }, []);
 
   const account = state.account;
   const initial = (account.email ?? "G").slice(0, 1).toUpperCase();
@@ -2924,9 +3034,7 @@ export function App() {
                   <Spinner />
                 </span>
                 {state.busy ? (
-                  <span className="turn-clock" title="本轮已用时间">
-                    {formatElapsedClock(now - (state.runStats.turnStartedAt ?? now))}
-                  </span>
+                  <TurnClock startedAt={state.runStats.turnStartedAt} title="本轮已用时间" />
                 ) : (
                   <span className="turn-clock" title={state.backgroundTasks.map((task) => task.title).join("\n")}>
                     {formatBackgroundLine(state.backgroundTasks)}
@@ -2963,36 +3071,16 @@ export function App() {
           <div className="home">
             <h1>新对话</h1>
             <p>指定工作区、模型和思考长度，然后直接开聊。</p>
-            <div
-              className={`composer home-composer ${dropping ? "dropping" : ""}`}
-              onDragOver={onComposerDragOver}
-              onDragLeave={() => setDropping(false)}
-              onDrop={(event) => void onComposerDrop(event)}
-            >
-              {slashHits.length > 0 && (
-                <SlashMenu commands={slashHits} activeIndex={slashIndex} onPick={completeSlash} />
-              )}
-              {mentionHits.length > 0 && (
-                <MentionMenu hits={mentionHits} activeIndex={mentionIndex} onPick={(hit) => void pickMention(hit)} />
-              )}
-              <ComposerChips
-                attachments={attachments}
-                sessionRefs={sessionRefs}
-                onRemoveAttachment={removeAttachment}
-                onRemoveSession={removeSessionRef}
-              />
-              <textarea
-                value={draft}
-                placeholder="今天要做什么？可拖入或粘贴图片、文件，打 @ 引用文件或对话。"
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => void onComposerKey(e)}
-                onPaste={(e) => void onComposerPaste(e)}
-                rows={4}
-              />
-              <div className="composer-toolbar">
-                <button className="icon-btn attach-btn" type="button" title="添加文件或图片" onClick={() => void pickAttachments()}>
-                  <AttachIcon />
-                </button>
+            <ComposerPane
+              className="home-composer"
+              busy={state.busy}
+              commands={state.commands}
+              models={state.models}
+              modelId={state.modelId}
+              effort={state.effort}
+              placeholder="今天要做什么？可拖入或粘贴图片、文件，打 @ 引用文件或对话。"
+              rows={4}
+              extraToolbar={
                 <div className={`chip workspace-chip ${draftWorkspace ? "has-value" : ""}`}>
                   <button
                     className="chip-main"
@@ -3008,29 +3096,17 @@ export function App() {
                     </button>
                   ) : null}
                 </div>
-                <ModelEffortPicker
-                  models={state.models}
-                  modelId={state.modelId}
-                  effort={state.effort}
-                  disabled={state.busy}
-                  onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
-                />
-                <ComposerSubmit
-                  busy={state.busy && !draft.trim() && !attachments.length && !sessionRefs.length}
-                  disabled={!draft.trim() && !attachments.length && !sessionRefs.length && !state.busy}
-                  onClick={() =>
-                    void (state.busy && !draft.trim() && !attachments.length && !sessionRefs.length
-                      ? stopTurn()
-                      : send())
-                  }
-                />
-              </div>
-            </div>
+              }
+              onSend={sendComposer}
+              onStop={stopTurn}
+              onEmptyEnter={sendQueuedNow}
+              onModelEffort={setModelEffort}
+            />
             {(state.error || busyError) && <div className="error-banner">{busyError ?? state.error}</div>}
           </div>
         ) : (
           <>
-            <TasksPane tasks={state.backgroundTasks} now={now} />
+            <TasksPane tasks={state.backgroundTasks} />
             <div
               className="transcript"
               ref={scroller}
@@ -3064,11 +3140,8 @@ export function App() {
                   showThoughts={state.settings.showThinkingBlocks}
                   groupTools={state.settings.groupToolVerbs}
                   showTimestamps={state.settings.showTimestamps}
-                  onOpenImage={(path, preview, name) => void openImage(path, preview, name)}
-                  onSelectTool={(item) => {
-                    setSelectedToolId(item.id);
-                    if (!state.inspectorOpen) void window.grok.setInspectorOpen(true);
-                  }}
+                  onOpenImage={openImage}
+                  onSelectTool={selectTool}
                 />
                 {!state.busy && (state.runStats.durationMs || state.runStats.tokens) ? (
                   <div className="session-stats">
@@ -3097,7 +3170,7 @@ export function App() {
               />
               {state.busy ? (
                 <div className="turn-live">
-                  进行中 {formatElapsedClock(now - (state.runStats.turnStartedAt ?? now))}
+                  进行中 <TurnClock startedAt={state.runStats.turnStartedAt} />
                   {state.runStats.tokens ? ` · ${formatTokens(state.runStats.tokens)} tok` : ""}
                   {state.settings.followUpBehavior === "steer" ? " · 追问将注入空隙" : " · Enter 排队追问"}
                 </div>
@@ -3110,54 +3183,19 @@ export function App() {
                   onChoose={(optionId) => void window.grok.permission(state.permission!.requestId, optionId)}
                 />
               )}
-              <div
-                className={`composer ${dropping ? "dropping" : ""}`}
-                onDragOver={onComposerDragOver}
-                onDragLeave={() => setDropping(false)}
-                onDrop={(event) => void onComposerDrop(event)}
-              >
-                {slashHits.length > 0 && (
-                  <SlashMenu commands={slashHits} activeIndex={slashIndex} onPick={completeSlash} />
-                )}
-                {mentionHits.length > 0 && (
-                  <MentionMenu hits={mentionHits} activeIndex={mentionIndex} onPick={(hit) => void pickMention(hit)} />
-                )}
-                <ComposerChips
-                  attachments={attachments}
-                  sessionRefs={sessionRefs}
-                  onRemoveAttachment={removeAttachment}
-                  onRemoveSession={removeSessionRef}
-                />
-                <textarea
-                  value={draft}
-                  placeholder="给 grok 下指令。打 / 可列出命令，打 @ 引用文件或对话。可拖入或粘贴图片、文件。Enter 发送，Ctrl+Enter 换行。"
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => void onComposerKey(e)}
-                  onPaste={(e) => void onComposerPaste(e)}
-                  rows={3}
-                />
-                <div className="composer-toolbar">
-                  <button className="icon-btn attach-btn" type="button" title="添加文件或图片" onClick={() => void pickAttachments()}>
-                    <AttachIcon />
-                  </button>
-                  <ModelEffortPicker
-                    models={state.models}
-                    modelId={state.modelId}
-                    effort={state.effort}
-                    disabled={state.busy}
-                    onChange={(modelId, effort) => void window.grok.setModelEffort(modelId, effort).then(setState)}
-                  />
-                  <ComposerSubmit
-                    busy={state.busy && !draft.trim() && !attachments.length && !sessionRefs.length}
-                    disabled={!draft.trim() && !attachments.length && !sessionRefs.length && !state.busy}
-                    onClick={() =>
-                      void (state.busy && !draft.trim() && !attachments.length && !sessionRefs.length
-                        ? stopTurn()
-                        : send())
-                    }
-                  />
-                </div>
-              </div>
+              <ComposerPane
+                busy={state.busy}
+                commands={state.commands}
+                models={state.models}
+                modelId={state.modelId}
+                effort={state.effort}
+                placeholder="给 grok 下指令。打 / 可列出命令，打 @ 引用文件或对话。可拖入或粘贴图片、文件。Enter 发送，Ctrl+Enter 换行。"
+                rows={3}
+                onSend={sendComposer}
+                onStop={stopTurn}
+                onEmptyEnter={sendQueuedNow}
+                onModelEffort={setModelEffort}
+              />
             </div>
           </>
         )}
