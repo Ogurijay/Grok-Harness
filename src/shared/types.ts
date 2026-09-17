@@ -24,6 +24,23 @@ export type ToolDiff = {
 
 export type AttachmentKind = "image" | "file";
 
+export type MediaKind = "image" | "video" | "voice";
+
+export type MediaAsset = {
+  id: string;
+  kind: MediaKind;
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  createdAt: number;
+  src: string;
+  prompt?: string;
+  sessionId?: string;
+  cwd?: string;
+  text?: string;
+};
+
 export type PromptAttachment = {
   id: string;
   name: string;
@@ -32,6 +49,13 @@ export type PromptAttachment = {
   size: number;
   kind: AttachmentKind;
   preview?: string;
+};
+
+export type ComposerSubmitPayload = {
+  text: string;
+  attachments: PromptAttachment[];
+  sessionRefs: SessionRef[];
+  now?: boolean;
 };
 
 export type MentionHit = {

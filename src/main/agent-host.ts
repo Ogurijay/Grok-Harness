@@ -234,6 +234,10 @@ export class AgentHost {
     return this.snapshot;
   }
 
+  localDb(): LocalDb {
+    return this.db;
+  }
+
   private emit(event: AgentUiEvent): void {
     for (const listener of this.listeners) listener(event);
   }
@@ -1004,7 +1008,7 @@ export class AgentHost {
     const init = asRecord(
       await client.request("initialize", {
         protocolVersion: 1,
-        clientInfo: { name: "grok-harness", version: "0.4.2" },
+        clientInfo: { name: "grok-harness", version: "0.5.0" },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,

@@ -4,7 +4,7 @@ Grok-Harness is a local Mac/Windows Electron shell for [Grok Build](https://gith
 
 Grok-Harness 是本机 Mac / Windows Electron 壳：通过 ACP 驱动 Grok Build，不重写 agent。
 
-Current version / 当前版本：**v0.4.2** (`package.json`)
+Current version / 当前版本：**v0.5.0** (`package.json`)
 
 ---
 

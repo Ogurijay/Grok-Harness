@@ -10,6 +10,7 @@ import type {
   MentionHit,
   ModelInfo,
   PermissionRequest,
+  ComposerSubmitPayload,
   PromptAttachment,
   SessionRef,
   SessionSort,
@@ -26,6 +27,9 @@ import { ModelEffortPicker } from "./ModelEffortPicker";
 import { SettingsPanel } from "./SettingsPanel";
 import { UpdatePanel } from "./UpdatePanel";
 import { UsagePanel } from "./UsagePanel";
+import { MediaStudio, type StudioTab } from "./MediaStudio";
+import { useImeEnterGuard } from "./ime";
+import { AttachIcon, ComposerSubmit } from "./composer-controls";
 
 const empty: AppSnapshot = {
   connection: "idle",
@@ -100,42 +104,6 @@ function Spinner({ size = 12 }: { size?: number }) {
     <svg className="spin" width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <circle cx="8" cy="8" r="6" stroke="currentColor" strokeOpacity="0.22" strokeWidth="2" />
       <path d="M14 8a6 6 0 0 0-6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function SendIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M8 3.2v9.6M3.75 7.45 8 3.2l4.25 4.25"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function StopIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="4.15" y="4.15" width="7.7" height="7.7" rx="1.7" fill="currentColor" />
-    </svg>
-  );
-}
-
-function AttachIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path
-        d="M9.4 4.6 5.15 8.85a2.2 2.2 0 1 0 3.1 3.1l5.05-5.05a3.3 3.3 0 0 0-4.67-4.67L3.4 7.4"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
     </svg>
   );
 }
@@ -597,35 +565,6 @@ function SlashMenu({
   );
 }
 
-function ComposerSubmit({
-  busy,
-  disabled,
-  onClick,
-}: {
-  busy: boolean;
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      className={`send-btn ${busy ? "stop" : ""}`}
-      type="button"
-      title={busy ? "Stop" : "Send"}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      {busy ? <StopIcon /> : <SendIcon />}
-    </button>
-  );
-}
-
-type ComposerSubmitPayload = {
-  text: string;
-  attachments: PromptAttachment[];
-  sessionRefs: SessionRef[];
-  now?: boolean;
-};
-
 const ComposerPane = memo(function ComposerPane({
   className,
   busy,
@@ -636,10 +575,12 @@ const ComposerPane = memo(function ComposerPane({
   placeholder,
   rows,
   extraToolbar,
+  injectText,
   onSend,
   onStop,
   onEmptyEnter,
   onModelEffort,
+  onInjectConsumed,
 }: {
   className?: string;
   busy: boolean;
@@ -650,10 +591,12 @@ const ComposerPane = memo(function ComposerPane({
   placeholder: string;
   rows: number;
   extraToolbar?: ReactNode;
+  injectText?: string;
   onSend: (payload: ComposerSubmitPayload) => Promise<void>;
   onStop: () => Promise<void>;
   onEmptyEnter?: () => Promise<void>;
   onModelEffort: (modelId: string, effort?: string) => void;
+  onInjectConsumed?: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
@@ -662,6 +605,7 @@ const ComposerPane = memo(function ComposerPane({
   const [mentionIndex, setMentionIndex] = useState(0);
   const [slashIndex, setSlashIndex] = useState(0);
   const [dropping, setDropping] = useState(false);
+  const { shouldHoldEnter, onCompositionEnd } = useImeEnterGuard();
 
   const slashQuery = useMemo(() => {
     const match = draft.match(/^\/([^\s]*)$/);
@@ -680,6 +624,15 @@ const ComposerPane = memo(function ComposerPane({
   useEffect(() => {
     setSlashIndex(0);
   }, [slashQuery]);
+
+  useEffect(() => {
+    if (!injectText) return;
+    setDraft((value) => {
+      const pad = !value || /\s$/.test(value) ? "" : " ";
+      return `${value}${pad}${injectText}`;
+    });
+    onInjectConsumed?.();
+  }, [injectText, onInjectConsumed]);
 
   useEffect(() => {
     setMentionIndex(0);
@@ -816,6 +769,7 @@ const ComposerPane = memo(function ComposerPane({
   }
 
   async function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (shouldHoldEnter(event)) return;
     const newline = event.key === "Enter" && (event.ctrlKey || event.metaKey);
     const plainEnter = event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
     if (newline) {
@@ -908,6 +862,7 @@ const ComposerPane = memo(function ComposerPane({
         placeholder={placeholder}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => void onComposerKey(event)}
+        onCompositionEnd={onCompositionEnd}
         onPaste={(event) => void onComposerPaste(event)}
         rows={rows}
       />
@@ -1795,6 +1750,8 @@ export function App() {
   const [archiveSelecting, setArchiveSelecting] = useState(false);
   const [archiveSelected, setArchiveSelected] = useState<Set<string>>(() => new Set());
   const [usageOpen, setUsageOpen] = useState(false);
+  const [studioTab, setStudioTab] = useState<StudioTab | undefined>();
+  const [injectText, setInjectText] = useState<string | undefined>();
   const [lightbox, setLightbox] = useState<{ path: string; src: string; name?: string } | undefined>();
   const [sidebarDrag, setSidebarDrag] = useState<SidebarDragState | undefined>();
   const sidebarDragRef = useRef<SidebarDragState | undefined>(sidebarDrag);
@@ -1939,6 +1896,7 @@ export function App() {
 
   async function beginNew(workspace?: string) {
     setBusyError(undefined);
+    setStudioTab(undefined);
     try {
       const snap = await window.grok.beginNewChat(workspace);
       setState(snap);
@@ -1972,6 +1930,7 @@ export function App() {
 
   async function openSession(session: SessionSummary) {
     setBusyError(undefined);
+    setStudioTab(undefined);
     followOutput.current = true;
     try {
       setState(await window.grok.openSession(session.sessionId, session.cwd));
@@ -2137,6 +2096,8 @@ export function App() {
   const setModelEffort = useCallback((modelId: string, effort?: string) => {
     void window.grok.setModelEffort(modelId, effort).then(setState);
   }, []);
+
+  const consumeInject = useCallback(() => setInjectText(undefined), []);
 
   const account = state.account;
   const initial = (account.email ?? "G").slice(0, 1).toUpperCase();
@@ -2511,6 +2472,30 @@ export function App() {
           <button className="icon-btn" type="button" title="添加对话" onClick={() => void beginNew()}>
             +
           </button>
+          <button
+            className={`icon-btn ${studioTab === "image" ? "on" : ""}`}
+            type="button"
+            title="图片生成"
+            onClick={() => setStudioTab("image")}
+          >
+            图
+          </button>
+          <button
+            className={`icon-btn ${studioTab === "video" ? "on" : ""}`}
+            type="button"
+            title="视频生成"
+            onClick={() => setStudioTab("video")}
+          >
+            视
+          </button>
+          <button
+            className={`icon-btn ${studioTab === "voice" ? "on" : ""}`}
+            type="button"
+            title="语音转写"
+            onClick={() => setStudioTab("voice")}
+          >
+            声
+          </button>
           <div className="rail-foot">
             <button
               className="icon-btn"
@@ -2597,6 +2582,29 @@ export function App() {
               </div>
             )}
           </div>
+          <nav className="sidebar-modules" aria-label="媒体模块">
+            <button
+              className={`sidebar-mod ${studioTab === "image" ? "on" : ""}`}
+              type="button"
+              onClick={() => setStudioTab("image")}
+            >
+              图片生成
+            </button>
+            <button
+              className={`sidebar-mod ${studioTab === "video" ? "on" : ""}`}
+              type="button"
+              onClick={() => setStudioTab("video")}
+            >
+              视频生成
+            </button>
+            <button
+              className={`sidebar-mod ${studioTab === "voice" ? "on" : ""}`}
+              type="button"
+              onClick={() => setStudioTab("voice")}
+            >
+              语音转写
+            </button>
+          </nav>
           <div className="session-list">
             {liveSessions.length === 0 && archivedSessions.length === 0 && (
               <div className="session-empty">本机还没有会话</div>
@@ -2710,7 +2718,7 @@ export function App() {
                                   <SessionRow
                                     key={session.sessionId}
                                     session={session}
-                                    active={session.sessionId === state.sessionId}
+                                    active={!studioTab && session.sessionId === state.sessionId}
                                     busy={sessionLive(session, state)}
                                     runningHint={formatSessionRunning(session)}
                                     menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
@@ -2732,7 +2740,7 @@ export function App() {
                           <SessionRow
                             key={session.sessionId}
                             session={session}
-                            active={session.sessionId === state.sessionId}
+                            active={!studioTab && session.sessionId === state.sessionId}
                             busy={sessionLive(session, state)}
                             runningHint={formatSessionRunning(session)}
                             menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
@@ -2880,7 +2888,7 @@ export function App() {
                     <SessionRow
                       key={session.sessionId}
                       session={session}
-                      active={session.sessionId === state.sessionId}
+                      active={!studioTab && session.sessionId === state.sessionId}
                       busy={sessionLive(session, state)}
                       runningHint={formatSessionRunning(session)}
                       menuOpen={menu?.kind === "session" && menu.id === session.sessionId}
@@ -3023,9 +3031,20 @@ export function App() {
 
       <section className="center pane">
         <div className="topbar">
-          <div className="topbar-title" title={state.sessionTitle || undefined}>
-            <strong>{home ? "新对话" : state.sessionTitle || "未选择对话"}</strong>
-            {!home && (state.busy || state.backgroundTasks.length) ? (
+          <div className="topbar-title" title={studioTab ? undefined : state.sessionTitle || undefined}>
+            <strong>
+              {studioTab === "image"
+                ? "图片生成"
+                : studioTab === "video"
+                  ? "视频生成"
+                  : studioTab === "voice"
+                    ? "语音转写"
+                    : home
+                      ? "新对话"
+                      : state.sessionTitle || "未选择对话"}
+            </strong>
+            {studioTab ? <span className="topbar-cwd">资源库</span> : null}
+            {!studioTab && !home && (state.busy || state.backgroundTasks.length) ? (
               <>
                 <span
                   className="topbar-spinner"
@@ -3042,12 +3061,12 @@ export function App() {
                 )}
               </>
             ) : null}
-            {(home ? draftWorkspace : state.workspace) ? (
+            {!studioTab && (home ? draftWorkspace : state.workspace) ? (
               <span className="topbar-cwd">{folderLabel((home ? draftWorkspace : state.workspace) ?? "")}</span>
             ) : null}
           </div>
           <div className="topbar-actions">
-            {currentSession && (
+            {!studioTab && currentSession && (
               <button
                 className="icon-btn"
                 type="button"
@@ -3057,17 +3076,37 @@ export function App() {
                 ⋯
               </button>
             )}
-            <button
-              className="icon-btn"
-              type="button"
-              title={state.inspectorOpen ? "收起右侧" : "打开检查器"}
-              onClick={() => void window.grok.setInspectorOpen(!state.inspectorOpen)}
-            >
-              {state.inspectorOpen ? "›|" : "|‹"}
-            </button>
+            {!studioTab ? (
+              <button
+                className="icon-btn"
+                type="button"
+                title={state.inspectorOpen ? "收起右侧" : "打开检查器"}
+                onClick={() => void window.grok.setInspectorOpen(!state.inspectorOpen)}
+              >
+                {state.inspectorOpen ? "›|" : "|‹"}
+              </button>
+            ) : null}
           </div>
         </div>
-        {home ? (
+        {studioTab ? (
+          <MediaStudio
+            tab={studioTab}
+            busy={state.busy}
+            sessionId={state.sessionId}
+            voiceCaptureMode={state.settings.voiceCaptureMode}
+            voiceLanguage={state.settings.voiceSttLanguage}
+            onGenerate={sendComposer}
+            onStop={stopTurn}
+            onInsertText={(text) => {
+              setInjectText(text);
+              setStudioTab(undefined);
+            }}
+            onOpenSession={(sessionId, cwd) => {
+              setStudioTab(undefined);
+              void window.grok.openSession(sessionId, cwd).then(setState);
+            }}
+          />
+        ) : home ? (
           <div className="home">
             <h1>新对话</h1>
             <p>指定工作区、模型和思考长度，然后直接开聊。</p>
@@ -3097,10 +3136,12 @@ export function App() {
                   ) : null}
                 </div>
               }
+              injectText={injectText}
               onSend={sendComposer}
               onStop={stopTurn}
               onEmptyEnter={sendQueuedNow}
               onModelEffort={setModelEffort}
+              onInjectConsumed={consumeInject}
             />
             {(state.error || busyError) && <div className="error-banner">{busyError ?? state.error}</div>}
           </div>
@@ -3191,17 +3232,19 @@ export function App() {
                 effort={state.effort}
                 placeholder="给 grok 下指令。打 / 可列出命令，打 @ 引用文件或对话。可拖入或粘贴图片、文件。Enter 发送，Ctrl+Enter 换行。"
                 rows={3}
+                injectText={injectText}
                 onSend={sendComposer}
                 onStop={stopTurn}
                 onEmptyEnter={sendQueuedNow}
                 onModelEffort={setModelEffort}
+                onInjectConsumed={consumeInject}
               />
             </div>
           </>
         )}
       </section>
 
-      {state.inspectorOpen && (
+      {!studioTab && state.inspectorOpen && (
         <div className="inspector-slot">
           <div
             className="resize-handle"

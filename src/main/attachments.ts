@@ -49,6 +49,13 @@ const MIME: Record<string, string> = {
   rs: "text/plain",
   go: "text/plain",
   zip: "application/zip",
+  wav: "audio/wav",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  ogg: "audio/ogg",
+  webm: "audio/webm",
+  flac: "audio/flac",
 };
 export const MAX_ATTACHMENTS = 20;
 export const MAX_FILE_BYTES = 200 * 1024 * 1024;
@@ -156,6 +163,22 @@ export function saveClipboardImage(): PromptAttachment | undefined {
     size: image.toPNG().length,
     kind,
     preview: previewFor(filePath, kind),
+  };
+}
+
+export function saveAudioBytes(bytes: Uint8Array, mime = "audio/webm", ext = "webm"): PromptAttachment {
+  const dir = join(app.getPath("userData"), "uploads");
+  mkdirSync(dir, { recursive: true });
+  const name = `voice-${Date.now()}.${ext.replace(/^\./, "") || "webm"}`;
+  const filePath = join(dir, name);
+  writeFileSync(filePath, bytes);
+  return {
+    id: randomUUID(),
+    name,
+    path: filePath,
+    mimeType: mime || "audio/webm",
+    size: bytes.byteLength,
+    kind: "file",
   };
 }
 

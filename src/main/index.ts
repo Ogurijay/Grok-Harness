@@ -1,9 +1,32 @@
-import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
-import { join } from "node:path";
+import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, net, protocol, shell } from "electron";
+import { basename, extname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AgentHost } from "./agent-host";
-import { copyImageToClipboard, imageDataUrl, inspectPaths, saveClipboardImage } from "./attachments";
+import { copyImageToClipboard, imageDataUrl, inspectPaths, saveAudioBytes, saveClipboardImage } from "./attachments";
 import { isGrokSettingKey } from "../shared/grok-settings";
-import type { GroupSort, PromptAttachment, SessionMode, SessionRef, SessionSort } from "../shared/types";
+import type { GroupSort, MediaKind, PromptAttachment, SessionMode, SessionRef, SessionSort } from "../shared/types";
+import {
+  deleteMediaAsset,
+  exportMediaFile,
+  isAllowedMediaPath,
+  listMediaLibrary,
+  pathFromMediaUrl,
+  saveTranscript,
+} from "./media-library";
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "grok-media",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      bypassCSP: true,
+      corsEnabled: true,
+    },
+  },
+]);
 
 const host = new AgentHost();
 let mainWindow: BrowserWindow | undefined;
@@ -102,6 +125,17 @@ function createWindow(): void {
 
 app.whenReady().then(async () => {
   if (process.platform === "win32") app.setAppUserModelId("ai.x.grok-harness");
+  protocol.handle("grok-media", (request) => {
+    try {
+      const filePath = pathFromMediaUrl(request.url);
+      if (!filePath || !isAllowedMediaPath(filePath)) {
+        return new Response("forbidden", { status: 403, statusText: "Forbidden" });
+      }
+      return net.fetch(pathToFileURL(filePath).href);
+    } catch {
+      return new Response("not found", { status: 404, statusText: "Not Found" });
+    }
+  });
   createMenu();
   await host.initLocal();
   createTray();
@@ -179,6 +213,7 @@ app.whenReady().then(async () => {
       filters: [
         { name: "全部文件", extensions: ["*"] },
         { name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] },
+        { name: "音频", extensions: ["wav", "mp3", "m4a", "aac", "ogg", "webm", "flac"] },
       ],
     };
     const result =
@@ -193,6 +228,18 @@ app.whenReady().then(async () => {
     return inspectPaths(list);
   });
   ipcMain.handle("grok:saveClipboardImage", () => saveClipboardImage() ?? null);
+  ipcMain.handle("grok:saveAudio", (_evt, payload: unknown, mime?: unknown, ext?: unknown) => {
+    const raw =
+      payload instanceof ArrayBuffer
+        ? new Uint8Array(payload)
+        : payload instanceof Uint8Array
+          ? payload
+          : Array.isArray(payload)
+            ? Uint8Array.from(payload as number[])
+            : undefined;
+    if (!raw?.byteLength) return null;
+    return saveAudioBytes(raw, String(mime || "audio/webm"), String(ext || "webm"));
+  });
   ipcMain.handle("grok:searchMentions", async (_evt, query: unknown) => {
     return host.searchMentions(String(query ?? ""));
   });
@@ -409,6 +456,65 @@ app.whenReady().then(async () => {
     if (!target) return { ok: false, error: "没有可打开的路径" };
     const error = await shell.openPath(target);
     return error ? { ok: false, error } : { ok: true };
+  });
+  ipcMain.handle("grok:listMedia", async (_evt, kind?: unknown) => {
+    const filter: MediaKind | undefined =
+      kind === "image" || kind === "video" || kind === "voice" ? kind : undefined;
+    return listMediaLibrary(host.localDb(), filter);
+  });
+  ipcMain.handle("grok:recordMediaPrompt", (_evt, kind: unknown, prompt: unknown, sessionId?: unknown) => {
+    if (kind !== "image" && kind !== "video" && kind !== "voice") return false;
+    host.localDb().addPendingPrompt(kind, String(prompt ?? ""), typeof sessionId === "string" ? sessionId : undefined);
+    return true;
+  });
+  ipcMain.handle("grok:saveTranscript", async (_evt, text: unknown, prompt?: unknown) => {
+    return saveTranscript(host.localDb(), String(text ?? ""), typeof prompt === "string" ? prompt : undefined);
+  });
+  ipcMain.handle("grok:deleteMedia", async (_evt, id: unknown) => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options: Electron.MessageBoxOptions = {
+      type: "warning",
+      buttons: ["删除", "取消"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "删除资源",
+      message: "从资源库删除这个文件？",
+      detail: "会删除磁盘上的生成文件，无法恢复。",
+    };
+    const result = win ? await dialog.showMessageBox(win, options) : await dialog.showMessageBox(options);
+    if (result.response !== 0) return { ok: false };
+    return deleteMediaAsset(host.localDb(), String(id ?? ""));
+  });
+  ipcMain.handle("grok:exportMedia", async (_evt, path: unknown, name?: unknown) => {
+    const src = String(path ?? "");
+    if (!src || !isAllowedMediaPath(src)) return { ok: false, error: "找不到文件" };
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const fileName = typeof name === "string" && name.trim() ? name.trim() : basename(src);
+    const result = win
+      ? await dialog.showSaveDialog(win, { defaultPath: fileName })
+      : await dialog.showSaveDialog({ defaultPath: fileName });
+    if (result.canceled || !result.filePath) return { ok: false };
+    try {
+      await exportMediaFile(src, result.filePath);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+  ipcMain.handle("grok:revealMedia", (_evt, path: unknown) => {
+    const target = String(path ?? "");
+    if (!target || !isAllowedMediaPath(target)) return false;
+    shell.showItemInFolder(target);
+    return true;
+  });
+  ipcMain.handle("grok:copyMedia", async (_evt, path: unknown) => {
+    const src = String(path ?? "");
+    if (!src || !isAllowedMediaPath(src)) return false;
+    const ext = extname(src).slice(1).toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext)) return copyImageToClipboard(src);
+    clipboard.writeText(src);
+    return true;
   });
 
   app.on("activate", () => showWindow());

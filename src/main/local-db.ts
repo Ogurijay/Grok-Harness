@@ -1,9 +1,33 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createRequire } from "node:module";
 import { app } from "electron";
 import initSqlJs, { type Database } from "sql.js";
-import type { SessionSummary, TokenDay, TokenUsageSummary } from "../shared/types";
+import type { MediaKind, SessionSummary, TokenDay, TokenUsageSummary } from "../shared/types";
+
+export type MediaRow = {
+  id: string;
+  kind: MediaKind;
+  path: string;
+  name: string;
+  mime: string;
+  size: number;
+  createdAt: number;
+  prompt?: string;
+  sessionId?: string;
+  cwd?: string;
+  body?: string;
+  hidden: boolean;
+};
+
+export type MediaPending = {
+  id: string;
+  kind: MediaKind;
+  prompt: string;
+  sessionId?: string;
+  createdAt: number;
+};
 
 const require = createRequire(import.meta.url);
 
@@ -56,6 +80,30 @@ export class LocalDb {
       CREATE TABLE IF NOT EXISTS token_days (
         day TEXT PRIMARY KEY,
         tokens INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS media_assets (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        mime TEXT,
+        size INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        prompt TEXT,
+        session_id TEXT,
+        cwd TEXT,
+        body TEXT,
+        hidden INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS media_pending (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        session_id TEXT,
+        created_at INTEGER NOT NULL,
+        consumed INTEGER NOT NULL DEFAULT 0
       );
     `);
     this.persist();
@@ -304,5 +352,131 @@ export class LocalDb {
       [sessionId],
     );
     this.persist();
+  }
+
+  listMediaRows(): MediaRow[] {
+    if (!this.db) return [];
+    const stmt = this.db.prepare(
+      "SELECT id, kind, path, name, mime, size, created_at, prompt, session_id, cwd, body, hidden FROM media_assets",
+    );
+    const rows: MediaRow[] = [];
+    while (stmt.step()) {
+      const row = stmt.get();
+      const id = String(row[0] ?? "");
+      const kind = String(row[1] ?? "");
+      const path = String(row[2] ?? "");
+      if (!id || !path || (kind !== "image" && kind !== "video" && kind !== "voice")) continue;
+      rows.push({
+        id,
+        kind,
+        path,
+        name: String(row[3] ?? ""),
+        mime: String(row[4] ?? ""),
+        size: Number(row[5] ?? 0) || 0,
+        createdAt: Number(row[6] ?? 0) || 0,
+        prompt: typeof row[7] === "string" && row[7] ? row[7] : undefined,
+        sessionId: typeof row[8] === "string" && row[8] ? row[8] : undefined,
+        cwd: typeof row[9] === "string" && row[9] ? row[9] : undefined,
+        body: typeof row[10] === "string" && row[10] ? row[10] : undefined,
+        hidden: Number(row[11]) === 1,
+      });
+    }
+    stmt.free();
+    return rows;
+  }
+
+  upsertMedia(row: MediaRow, persist = true): void {
+    if (!this.db) return;
+    this.db.run(
+      `INSERT INTO media_assets(id, kind, path, name, mime, size, created_at, prompt, session_id, cwd, body, hidden)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET
+         kind = excluded.kind,
+         name = excluded.name,
+         mime = excluded.mime,
+         size = excluded.size,
+         created_at = excluded.created_at,
+         prompt = CASE WHEN excluded.prompt IS NOT NULL AND excluded.prompt != '' THEN excluded.prompt ELSE media_assets.prompt END,
+         session_id = COALESCE(excluded.session_id, media_assets.session_id),
+         cwd = COALESCE(excluded.cwd, media_assets.cwd),
+         body = CASE WHEN excluded.body IS NOT NULL AND excluded.body != '' THEN excluded.body ELSE media_assets.body END`,
+      [
+        row.id,
+        row.kind,
+        row.path,
+        row.name,
+        row.mime,
+        row.size,
+        row.createdAt,
+        row.prompt ?? "",
+        row.sessionId ?? "",
+        row.cwd ?? "",
+        row.body ?? "",
+        row.hidden ? 1 : 0,
+      ],
+    );
+    if (persist) this.persist();
+  }
+
+  flush(): void {
+    this.persist();
+  }
+
+  hideMedia(id: string): MediaRow | undefined {
+    if (!this.db) return undefined;
+    const stmt = this.db.prepare(
+      "SELECT id, kind, path, name, mime, size, created_at, prompt, session_id, cwd, body, hidden FROM media_assets WHERE id = ?",
+    );
+    stmt.bind([id]);
+    const raw = stmt.step() ? stmt.get() : undefined;
+    stmt.free();
+    if (!raw) return undefined;
+    this.db.run("UPDATE media_assets SET hidden = 1 WHERE id = ?", [id]);
+    this.persist();
+    const kind = String(raw[1] ?? "");
+    if (kind !== "image" && kind !== "video" && kind !== "voice") return undefined;
+    return {
+      id: String(raw[0] ?? ""),
+      kind,
+      path: String(raw[2] ?? ""),
+      name: String(raw[3] ?? ""),
+      mime: String(raw[4] ?? ""),
+      size: Number(raw[5] ?? 0) || 0,
+      createdAt: Number(raw[6] ?? 0) || 0,
+      prompt: typeof raw[7] === "string" && raw[7] ? raw[7] : undefined,
+      sessionId: typeof raw[8] === "string" && raw[8] ? raw[8] : undefined,
+      cwd: typeof raw[9] === "string" && raw[9] ? raw[9] : undefined,
+      body: typeof raw[10] === "string" && raw[10] ? raw[10] : undefined,
+      hidden: true,
+    };
+  }
+
+  addPendingPrompt(kind: MediaKind, prompt: string, sessionId?: string): void {
+    if (!this.db) return;
+    const text = prompt.trim();
+    if (!text) return;
+    this.db.run("INSERT INTO media_pending(id, kind, prompt, session_id, created_at, consumed) VALUES (?, ?, ?, ?, ?, 0)", [
+      randomUUID(),
+      kind,
+      text,
+      sessionId ?? "",
+      Date.now(),
+    ]);
+    this.persist();
+  }
+
+  consumePending(kind: MediaKind, before: number): string | undefined {
+    if (!this.db) return undefined;
+    const stmt = this.db.prepare(
+      "SELECT id, prompt FROM media_pending WHERE kind = ? AND consumed = 0 AND created_at <= ? ORDER BY created_at ASC LIMIT 1",
+    );
+    stmt.bind([kind, before]);
+    const row = stmt.step() ? stmt.get() : undefined;
+    stmt.free();
+    if (!row) return undefined;
+    const id = String(row[0] ?? "");
+    const prompt = String(row[1] ?? "").trim();
+    if (id) this.db.run("UPDATE media_pending SET consumed = 1 WHERE id = ?", [id]);
+    return prompt || undefined;
   }
 }

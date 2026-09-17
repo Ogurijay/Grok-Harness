@@ -35,6 +35,7 @@ const FALLBACK: SlashCommand[] = [
   { name: "loop", description: "按间隔循环执行", hint: "30m 任务" },
   { name: "imagine", description: "生成图片", hint: "描述" },
   { name: "imagine-video", description: "生成视频", hint: "描述" },
+  { name: "voice", description: "语音转写 / 听写", hint: "开始或停止" },
   { name: "btw", description: "旁路提问，不打断当前任务", hint: "问题" },
   { name: "feedback", description: "发送反馈" },
   { name: "docs", description: "打开内置文档", hint: "标题" },

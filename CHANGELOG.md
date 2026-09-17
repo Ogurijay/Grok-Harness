@@ -6,6 +6,26 @@ Every GitHub iteration must add a section here in both Chinese and English. See 
 
 ---
 
+## 0.5.0 — 2026-09-17
+
+### 中文
+
+- 侧栏新增图片生成、视频生成、语音转写；点击后直接替换中间对话区，不再弹层。
+- 统一资源库：汇总本机 `~/.grok/sessions` 里的生成图和视频，瀑布流管理；可再用提示、作参考、下载、删除、打开原对话。
+- 生成走 Grok 原生命令 `/imagine`、`/imagine-video`；语音是听写转写。
+- 输入法组字时回车只上屏，不再误发送；上屏后再按一次 Enter 才发送。
+- 对话输入栏去掉「媒体」按钮；资源库的附件和发送按钮与对话输入栏同一套图标。
+
+### English
+
+- Sidebar modules for image gen, video gen, and speech-to-text replace the chat pane instead of opening a modal.
+- Unified library scans generated images and videos under `~/.grok/sessions`; masonry gallery with prompt reuse, reference, download, delete, and open source chat.
+- Generation uses native `/imagine` and `/imagine-video`; voice is dictation / transcription.
+- IME Enter commits composition without sending; a second Enter sends.
+- Composer media button removed; studio attach and send use the same icons as chat.
+
+---
+
 ## 0.4.2 — 2026-09-16
 
 ### 中文

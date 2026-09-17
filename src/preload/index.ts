@@ -3,6 +3,8 @@ import type {
   AgentUiEvent,
   AppSnapshot,
   GroupSort,
+  MediaAsset,
+  MediaKind,
   MentionHit,
   PromptAttachment,
   SessionMode,
@@ -25,6 +27,7 @@ export type GrokApi = {
   pickFiles: () => Promise<PromptAttachment[]>;
   inspectPaths: (paths: string[]) => Promise<PromptAttachment[]>;
   saveClipboardImage: () => Promise<PromptAttachment | null>;
+  saveAudio: (bytes: ArrayBuffer, mime?: string, ext?: string) => Promise<PromptAttachment | null>;
   searchMentions: (query: string) => Promise<MentionHit[]>;
   cancel: () => Promise<AppSnapshot>;
   permission: (requestId: string, optionId: string | null) => Promise<AppSnapshot>;
@@ -60,6 +63,13 @@ export type GrokApi = {
   imageDataUrl: (source: string) => Promise<string | null>;
   imageMenu: (source: string) => Promise<boolean>;
   openPath: (folder: string) => Promise<{ ok: boolean; error?: string }>;
+  listMedia: (kind?: MediaKind) => Promise<MediaAsset[]>;
+  recordMediaPrompt: (kind: MediaKind, prompt: string, sessionId?: string) => Promise<boolean>;
+  saveTranscript: (text: string, prompt?: string) => Promise<MediaAsset>;
+  deleteMedia: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  exportMedia: (path: string, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  revealMedia: (path: string) => Promise<boolean>;
+  copyMedia: (path: string) => Promise<boolean>;
   onEvent: (cb: (event: AgentUiEvent) => void) => () => void;
 };
 
@@ -76,6 +86,7 @@ const api: GrokApi = {
   pickFiles: () => ipcRenderer.invoke("grok:pickFiles"),
   inspectPaths: (paths) => ipcRenderer.invoke("grok:inspectPaths", paths),
   saveClipboardImage: () => ipcRenderer.invoke("grok:saveClipboardImage"),
+  saveAudio: (bytes, mime, ext) => ipcRenderer.invoke("grok:saveAudio", bytes, mime, ext),
   searchMentions: (query) => ipcRenderer.invoke("grok:searchMentions", query),
   cancel: () => ipcRenderer.invoke("grok:cancel"),
   permission: (requestId, optionId) => ipcRenderer.invoke("grok:permission", requestId, optionId),
@@ -111,6 +122,13 @@ const api: GrokApi = {
   imageDataUrl: (source) => ipcRenderer.invoke("grok:imageDataUrl", source),
   imageMenu: (source) => ipcRenderer.invoke("grok:imageMenu", source),
   openPath: (folder) => ipcRenderer.invoke("grok:openPath", folder),
+  listMedia: (kind) => ipcRenderer.invoke("grok:listMedia", kind),
+  recordMediaPrompt: (kind, prompt, sessionId) => ipcRenderer.invoke("grok:recordMediaPrompt", kind, prompt, sessionId),
+  saveTranscript: (text, prompt) => ipcRenderer.invoke("grok:saveTranscript", text, prompt),
+  deleteMedia: (id) => ipcRenderer.invoke("grok:deleteMedia", id),
+  exportMedia: (path, name) => ipcRenderer.invoke("grok:exportMedia", path, name),
+  revealMedia: (path) => ipcRenderer.invoke("grok:revealMedia", path),
+  copyMedia: (path) => ipcRenderer.invoke("grok:copyMedia", path),
   onEvent: (cb) => {
     const listener = (_event: unknown, payload: AgentUiEvent) => cb(payload);
     ipcRenderer.on("grok:event", listener);

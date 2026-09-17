@@ -39,6 +39,10 @@ export type GrokSettings = {
   hunkTrackerMode: string;
   voiceKeybindEnabled: boolean;
   voiceCaptureMode: string;
+  voiceSttLanguage: string;
+  imageGen: boolean;
+  videoGen: boolean;
+  voiceMode: boolean;
   telemetry: boolean;
   feedback: boolean;
   lspTools: boolean;
@@ -129,6 +133,10 @@ export const GROK_SETTINGS_DEFAULTS: GrokSettings = {
   hunkTrackerMode: "agent_only",
   voiceKeybindEnabled: true,
   voiceCaptureMode: "hold",
+  voiceSttLanguage: "auto",
+  imageGen: true,
+  videoGen: true,
+  voiceMode: true,
   telemetry: false,
   feedback: true,
   lspTools: false,
@@ -377,8 +385,19 @@ export const SETTINGS_SECTIONS: { title: string; fields: SettingsField[] }[] = [
         label: "语音采集",
         hint: "[ui] voice_capture_mode",
         options: [
-          { value: "hold", label: "hold" },
-          { value: "toggle", label: "toggle" },
+          { value: "hold", label: "按住说话" },
+          { value: "toggle", label: "点按开关" },
+        ],
+      },
+      {
+        key: "voiceSttLanguage",
+        kind: "select",
+        label: "转写语言",
+        hint: "[ui] voice_stt_language",
+        options: [
+          { value: "auto", label: "自动" },
+          { value: "zh", label: "中文" },
+          { value: "en", label: "English" },
         ],
       },
       {
@@ -439,6 +458,9 @@ export const SETTINGS_SECTIONS: { title: string; fields: SettingsField[] }[] = [
       { key: "codebaseIndexing", kind: "toggle", label: "代码索引", hint: "[features] codebase_indexing" },
       { key: "twoPassCompaction", kind: "toggle", label: "双通道压缩", hint: "[features] two_pass_compaction" },
       { key: "remoteFetch", kind: "toggle", label: "在线模型目录", hint: "[features] remote_fetch" },
+      { key: "imageGen", kind: "toggle", label: "图片生成 /imagine", hint: "[features] image_gen" },
+      { key: "videoGen", kind: "toggle", label: "视频生成 /imagine-video", hint: "[features] video_gen" },
+      { key: "voiceMode", kind: "toggle", label: "语音转写", hint: "[features] voice_mode" },
       { key: "webFetch", kind: "toggle", label: "web_fetch 工具", hint: "[features] web_fetch" },
       { key: "writeFile", kind: "toggle", label: "write 工具", hint: "[features] write_file" },
       { key: "toolSearch", kind: "toggle", label: "MCP 工具发现", hint: "[features] tool_search" },

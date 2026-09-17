@@ -1,6 +1,6 @@
 {
   "name": "grok-harness",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "private": true,
   "description": "Grok-Harness v0.1 — local Mac/Windows shell for Grok Build over ACP",
   "type": "module",
